@@ -10,6 +10,7 @@ import importlib
 import py_compile
 
 import anyio
+import anyio.to_thread
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.server.lowlevel.server import NotificationOptions
 from mcp.server.stdio import stdio_server
@@ -33,11 +34,13 @@ def register_tools():
 async def reload_server(ctx: Context) -> str:
     """
     Reload the flstudio MCP server's code from disk (fl_bridge.py and fl_tools.py)
+    and the FL Studio script's request handlers (mcp_handlers.py)
 
-    Call this after editing the server so the changes take effect without
-    restarting the Claude app. Open MIDI ports and the FL Studio script log are
-    kept. If either file has a syntax error, nothing is reloaded. Changes to
-    trigger.py itself still need an app restart.
+    Call this after editing either side so the changes take effect without
+    restarting the Claude app or reopening FL Studio's MIDI Settings. Open MIDI
+    ports and the FL Studio script log are kept. If a server file has a syntax
+    error, nothing is reloaded. Changes to trigger.py, or to the main FL script
+    (device_test.py), still need a restart / manual reload.
     """
     for module in (fl_bridge, fl_tools):
         try:
@@ -54,9 +57,13 @@ async def reload_server(ctx: Context) -> str:
     await ctx.session.send_tool_list_changed()
     added = sorted(set(_registered_tools) - old_tools)
     removed = sorted(old_tools - set(_registered_tools))
+    # fl_tools.after_reload also reloads the FL Studio script's request handlers
+    hook = getattr(fl_tools, "after_reload", None)
+    hook_result = await anyio.to_thread.run_sync(hook) if hook else None
     return (f"Reloaded {len(_registered_tools)} tools."
             + (f" Added: {', '.join(added)}." if added else "")
-            + (f" Removed: {', '.join(removed)}." if removed else ""))
+            + (f" Removed: {', '.join(removed)}." if removed else "")
+            + (f" {hook_result}" if hook_result else ""))
 
 register_tools()
 

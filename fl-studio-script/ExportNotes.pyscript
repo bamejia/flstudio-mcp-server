@@ -1,0 +1,61 @@
+"""
+ExportNotes - FL Studio Piano Roll script for the flstudio MCP server
+
+Reads every note in the open piano roll and writes them as JSON to
+piano_roll_state.json next to this script. The MCP server's get_notes tool
+triggers it with Ctrl+Alt+Y ("Run last script again"), so run it once by hand
+first: piano roll menu > Tools > Scripting > ExportNotes.
+
+The server writes export_request.json with a request id before triggering;
+the id is echoed back so the server can tell a fresh export from an old file.
+
+Piano roll scripts may only access files in their own folder, and only when
+FL Studio's user data folder is not on OneDrive.
+"""
+
+import flpianoroll as flp
+import json
+import os
+
+SCRIPT_DIR = os.path.expanduser(os.path.join("~", "Documents", "Image-Line", "FL Studio", "Settings", "Piano roll scripts"))
+REQUEST_FILE = os.path.join(SCRIPT_DIR, "export_request.json")
+STATE_FILE = os.path.join(SCRIPT_DIR, "piano_roll_state.json")
+
+
+def read_request_id():
+    try:
+        with open(REQUEST_FILE, "r") as f:
+            return json.load(f).get("id")
+    except Exception:
+        return None  # run by hand, or no request file
+
+
+def collect_notes():
+    ppq = flp.score.PPQ
+    notes = []
+    for i in range(flp.score.noteCount):
+        n = flp.score.getNote(i)
+        notes.append({
+            "number": n.number,
+            "time_ticks": n.time,
+            "length_ticks": n.length,
+            "velocity": n.velocity,
+            "pan": n.pan,
+            "release": n.release,
+            "fcut": n.fcut,
+            "fres": n.fres,
+            "pitchofs": n.pitchofs,
+            "color": n.color,
+            "slide": n.slide,
+            "porta": n.porta,
+            "muted": n.muted,
+            "selected": n.selected,
+        })
+    return {"ppq": ppq, "noteCount": len(notes), "notes": notes}
+
+
+def apply(form=None):
+    data = collect_notes()
+    data["request_id"] = read_request_id()
+    with open(STATE_FILE, "w") as f:
+        json.dump(data, f)

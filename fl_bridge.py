@@ -4,13 +4,17 @@ MIDI link between the MCP server and the FL Studio controller script.
 Reloaded by the reload_server tool, so anything that must survive a reload
 (open MIDI ports, queues, the script log) is only created on first import.
 """
+import ctypes
 import itertools
 import json
+import os
 import queue
 import sys
 import threading
 import time
 from collections import deque
+from ctypes import wintypes
+from pathlib import Path
 
 import mido
 from mido import Message
@@ -155,6 +159,182 @@ def fl_request(cmd, timeout=10.0, **args):
     if not reply["ok"]:
         raise FLStudioError(reply["error"])
     return reply["result"]
+
+# --- Piano roll notes ----------------------------------------------------------
+# The controller script can't read piano roll notes, but a piano roll script can:
+# ExportNotes.pyscript writes them to piano_roll_state.json in its own folder.
+# Piano roll scripts only run from FL's menu or its "Run last script again"
+# shortcut (Ctrl+Alt+Y), so the server focuses FL Studio, presses that shortcut
+# and waits for a file carrying the request id it wrote to export_request.json.
+FL_USER_DATA_DIR = Path(os.environ.get("FL_USER_DATA_DIR", Path.home() / "Documents" / "Image-Line" / "FL Studio"))
+PIANO_ROLL_SCRIPTS_DIR = FL_USER_DATA_DIR / "Settings" / "Piano roll scripts"
+EXPORT_REQUEST_FILE = PIANO_ROLL_SCRIPTS_DIR / "export_request.json"
+EXPORT_STATE_FILE = PIANO_ROLL_SCRIPTS_DIR / "piano_roll_state.json"
+FL_PROCESS_NAME = "fl64.exe"
+
+VK_CONTROL, VK_MENU, VK_Y = 0x11, 0x12, 0x59
+KEYEVENTF_KEYUP = 0x0002
+SW_RESTORE = 9
+SW_SHOWMINNOACTIVE = 7  # minimize without taking focus
+GW_HWNDPREV = 3  # the window just above, in the stacking order
+GW_OWNER = 4
+SWP_NOSIZE, SWP_NOMOVE, SWP_NOACTIVATE = 0x0001, 0x0002, 0x0010
+GWL_EXSTYLE = -20
+WS_EX_TOPMOST = 0x0008
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+# Own DLL instances with explicit signatures, so 64-bit window handles aren't
+# truncated and other ctypes users in the process are unaffected
+user32 = ctypes.WinDLL("user32", use_last_error=True)
+kernel32 = ctypes.WinDLL("kernel32")
+WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+user32.EnumWindows.argtypes = [WNDENUMPROC, wintypes.LPARAM]
+user32.IsWindowVisible.argtypes = [wintypes.HWND]
+user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetWindow.restype = wintypes.HWND
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.IsIconic.argtypes = [wintypes.HWND]
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.GetWindowLongW.restype = ctypes.c_long
+user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+kernel32.OpenProcess.restype = wintypes.HANDLE
+kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+                                                ctypes.POINTER(wintypes.DWORD)]
+kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+def fl_windows():
+    """(handle, title) of FL Studio's visible top-level windows"""
+    windows = []
+
+    @WNDENUMPROC
+    def check(hwnd, _):
+        if user32.IsWindowVisible(hwnd):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+            process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+            if process:
+                path = ctypes.create_unicode_buffer(1024)
+                size = wintypes.DWORD(1024)
+                if kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)) \
+                        and path.value.lower().endswith("\\" + FL_PROCESS_NAME):
+                    title = ctypes.create_unicode_buffer(512)
+                    user32.GetWindowTextW(hwnd, title, 512)
+                    windows.append((hwnd, title.value))
+                kernel32.CloseHandle(process)
+        return True
+
+    user32.EnumWindows(check, 0)
+    return windows
+
+def focus_window(hwnd):
+    """Bring a window to the front. Windows only lets the foreground app hand
+    over focus, so briefly attach to its input queue while switching."""
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, SW_RESTORE)
+    foreground_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+    this_thread = kernel32.GetCurrentThreadId()
+    user32.AttachThreadInput(this_thread, foreground_thread, True)
+    try:
+        user32.BringWindowToTop(hwnd)
+        user32.SetForegroundWindow(hwnd)
+    finally:
+        user32.AttachThreadInput(this_thread, foreground_thread, False)
+    return user32.GetForegroundWindow() == hwnd
+
+def window_title(hwnd):
+    title = ctypes.create_unicode_buffer(512)
+    user32.GetWindowTextW(hwnd, title, 512)
+    return title.value
+
+def visible_window_above(hwnd):
+    """The nearest window above hwnd in the stacking order that is a normal window on
+    screen (visible, not minimized, not owned by another, not always-on-top), or None.
+    Hidden helper windows sit in the order too, so the window directly above often isn't one."""
+    above = user32.GetWindow(hwnd, GW_HWNDPREV)
+    while above:
+        if (user32.IsWindowVisible(above) and not user32.IsIconic(above)
+                and not user32.GetWindow(above, GW_OWNER)
+                and not user32.GetWindowLongW(above, GWL_EXSTYLE) & WS_EX_TOPMOST):
+            return above
+        above = user32.GetWindow(above, GW_HWNDPREV)
+    return None
+
+def press_ctrl_alt_y():
+    for vk in (VK_CONTROL, VK_MENU, VK_Y):
+        user32.keybd_event(vk, 0, 0, 0)
+    for vk in (VK_Y, VK_MENU, VK_CONTROL):
+        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+
+def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None):
+    """Trigger ExportNotes in FL Studio's focused piano roll and return its output.
+    before_shortcut runs once FL Studio is on screen, right before Ctrl+Alt+Y.
+    Problems putting the windows back are appended to window_warnings."""
+    if window_warnings is None:
+        window_warnings = []
+    windows = fl_windows()
+    if not windows:
+        raise FLStudioError("Couldn't find FL Studio's window. Is FL Studio running?")
+    # A detached piano roll is its own window; otherwise send the shortcut to the
+    # main window (titled "... FL Studio 20xx"; FL also has untitled helper windows)
+    target = (next((hwnd for hwnd, title in windows if title.lower().startswith("piano roll")), None)
+              or next((hwnd for hwnd, title in windows if "fl studio" in title.lower()), None)
+              or next((hwnd for hwnd, _ in windows if not user32.GetWindow(hwnd, GW_OWNER)), windows[0][0]))
+    request_id = f"{time.time():.6f}"
+    EXPORT_REQUEST_FILE.write_text(json.dumps({"id": request_id}))
+    previous = user32.GetForegroundWindow()  # whatever window the user is in, any app
+    was_minimized = bool(user32.IsIconic(target))
+    above_fl = visible_window_above(target)  # to put FL back at the same depth afterwards
+    try:
+        if not focus_window(target):
+            raise FLStudioError("Windows didn't let FL Studio come to the front, so the shortcut wasn't sent.")
+        # Un-minimizing animates; wait until FL is really restored and in front
+        ready_by = time.time() + 2.0
+        while (user32.IsIconic(target) or user32.GetForegroundWindow() != target) and time.time() < ready_by:
+            time.sleep(0.05)
+        time.sleep(0.5 if was_minimized else 0.15)
+        if before_shortcut:
+            before_shortcut()
+            time.sleep(0.1)
+        deadline = time.time() + timeout
+        retry_at = time.time() + 1.5  # press once more if the first press was missed
+        press_ctrl_alt_y()
+        while time.time() < deadline:
+            try:
+                state = json.loads(EXPORT_STATE_FILE.read_text())
+            except (OSError, ValueError):  # not written yet, or caught mid-write
+                state = None
+            if state and state.get("request_id") == request_id:
+                return state
+            if retry_at and time.time() > retry_at:
+                retry_at = None
+                press_ctrl_alt_y()
+            time.sleep(0.05)
+        raise FLStudioError("ExportNotes didn't respond to Ctrl+Alt+Y within "
+                            f"{timeout}s. Run it once from the piano roll (Tools > Scripting > "
+                            "ExportNotes) so it becomes the 'last script', then try again.")
+    finally:
+        # Hand focus back, unless the user already switched to another window meanwhile,
+        # and slot FL back under the window that was just above it, so every window
+        # ends up in the same stacking order as before
+        if previous and user32.GetForegroundWindow() in {hwnd for hwnd, _ in fl_windows()}:
+            focus_window(previous)
+            if above_fl and not user32.SetWindowPos(target, above_fl, 0, 0, 0, 0,
+                                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE):
+                window_warnings.append(f"Couldn't put FL Studio back under {window_title(above_fl)!r} "
+                                       f"(Windows error {ctypes.get_last_error()})")
+            if was_minimized:
+                user32.ShowWindow(target, SW_SHOWMINNOACTIVE)
 
 # Open the ports on first import: the output fails loudly if loopMIDI isn't
 # running, the input is opened now so script output is captured from the start
