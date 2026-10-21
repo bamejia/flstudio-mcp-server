@@ -237,20 +237,31 @@ def fl_windows():
     user32.EnumWindows(check, 0)
     return windows
 
-def focus_window(hwnd):
-    """Bring a window to the front. Windows only lets the foreground app hand
-    over focus, so briefly attach to its input queue while switching."""
+def focus_window(hwnd, accept=None, attempts=6):
+    """Bring a window to the front; True once it (or any window in accept) is in
+    front. Windows only lets the foreground app hand over focus, so briefly attach
+    to its input queue while switching. That doesn't always work the first time,
+    so retry, and after a few tries also tap Alt (which lifts Windows' lock)."""
+    accept = set(accept or ()) | {hwnd}
     if user32.IsIconic(hwnd):
         user32.ShowWindow(hwnd, SW_RESTORE)
-    foreground_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
-    this_thread = kernel32.GetCurrentThreadId()
-    user32.AttachThreadInput(this_thread, foreground_thread, True)
-    try:
-        user32.BringWindowToTop(hwnd)
-        user32.SetForegroundWindow(hwnd)
-    finally:
-        user32.AttachThreadInput(this_thread, foreground_thread, False)
-    return user32.GetForegroundWindow() == hwnd
+    for attempt in range(attempts):
+        foreground_thread = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+        this_thread = kernel32.GetCurrentThreadId()
+        user32.AttachThreadInput(this_thread, foreground_thread, True)
+        try:
+            if attempt >= 3:
+                user32.keybd_event(VK_MENU, 0, 0, 0)
+                user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            user32.AttachThreadInput(this_thread, foreground_thread, False)
+        time.sleep(0.05)
+        if user32.GetForegroundWindow() in accept:
+            return True
+        time.sleep(0.1)
+    return False
 
 def window_title(hwnd):
     title = ctypes.create_unicode_buffer(512)
@@ -276,31 +287,36 @@ def press_ctrl_alt_y():
     for vk in (VK_Y, VK_MENU, VK_CONTROL):
         user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
 
-def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None):
+def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None, request=None):
     """Trigger ExportNotes in FL Studio's focused piano roll and return its output.
     before_shortcut runs once FL Studio is on screen, right before Ctrl+Alt+Y.
-    Problems putting the windows back are appended to window_warnings."""
+    Problems putting the windows back are appended to window_warnings.
+    request adds fields to export_request.json, e.g. {"add_notes": [...]}."""
     if window_warnings is None:
         window_warnings = []
     windows = fl_windows()
     if not windows:
         raise FLStudioError("Couldn't find FL Studio's window. Is FL Studio running?")
-    # A detached piano roll is its own window; otherwise send the shortcut to the
-    # main window (titled "... FL Studio 20xx"; FL also has untitled helper windows)
-    target = (next((hwnd for hwnd, title in windows if title.lower().startswith("piano roll")), None)
-              or next((hwnd for hwnd, title in windows if "fl studio" in title.lower()), None)
-              or next((hwnd for hwnd, _ in windows if not user32.GetWindow(hwnd, GW_OWNER)), windows[0][0]))
+    # Always work with FL's main window (titled "... FL Studio 20xx"; FL also has
+    # untitled helper windows). Detached editors like the piano roll are windows
+    # owned by it: they move with it in the stacking order, FL routes the shortcut
+    # to whichever of them it has focused, and the piano roll window is recreated
+    # when it's reopened, so its handle can't be kept.
+    unowned = [(hwnd, title) for hwnd, title in windows if not user32.GetWindow(hwnd, GW_OWNER)]
+    target = (next((hwnd for hwnd, title in unowned if "fl studio" in title.lower()), None)
+              or (unowned or windows)[0][0])
     request_id = f"{time.time():.6f}"
-    EXPORT_REQUEST_FILE.write_text(json.dumps({"id": request_id}))
+    EXPORT_REQUEST_FILE.write_text(json.dumps({**(request or {}), "id": request_id}))
     previous = user32.GetForegroundWindow()  # whatever window the user is in, any app
     was_minimized = bool(user32.IsIconic(target))
     above_fl = visible_window_above(target)  # to put FL back at the same depth afterwards
     try:
-        if not focus_window(target):
+        fl_handles = {hwnd for hwnd, _ in windows}
+        if not focus_window(target, accept=fl_handles):
             raise FLStudioError("Windows didn't let FL Studio come to the front, so the shortcut wasn't sent.")
         # Un-minimizing animates; wait until FL is really restored and in front
         ready_by = time.time() + 2.0
-        while (user32.IsIconic(target) or user32.GetForegroundWindow() != target) and time.time() < ready_by:
+        while (user32.IsIconic(target) or user32.GetForegroundWindow() not in fl_handles) and time.time() < ready_by:
             time.sleep(0.05)
         time.sleep(0.5 if was_minimized else 0.15)
         if before_shortcut:
@@ -324,15 +340,19 @@ def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None):
                             f"{timeout}s. Run it once from the piano roll (Tools > Scripting > "
                             "ExportNotes) so it becomes the 'last script', then try again.")
     finally:
+        # Remove the request so running ExportNotes by hand later can't apply it again
+        EXPORT_REQUEST_FILE.unlink(missing_ok=True)
         # Hand focus back, unless the user already switched to another window meanwhile,
         # and slot FL back under the window that was just above it, so every window
         # ends up in the same stacking order as before
         if previous and user32.GetForegroundWindow() in {hwnd for hwnd, _ in fl_windows()}:
             focus_window(previous)
-            if above_fl and not user32.SetWindowPos(target, above_fl, 0, 0, 0, 0,
-                                                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE):
-                window_warnings.append(f"Couldn't put FL Studio back under {window_title(above_fl)!r} "
-                                       f"(Windows error {ctypes.get_last_error()})")
+            if above_fl and visible_window_above(target) != above_fl:
+                if not user32.SetWindowPos(target, above_fl, 0, 0, 0, 0,
+                                           SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE):
+                    error = ctypes.get_last_error()  # read before any other Windows call overwrites it
+                    window_warnings.append(f"Couldn't put FL Studio back under {window_title(above_fl)!r} "
+                                           f"(Windows error {error})")
             if was_minimized:
                 user32.ShowWindow(target, SW_SHOWMINNOACTIVE)
 

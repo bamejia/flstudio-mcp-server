@@ -1,7 +1,8 @@
 """
 ExportNotes - FL Studio Piano Roll script for the flstudio MCP server
 
-Reads every note in the open piano roll and writes them as JSON to
+If the server's request includes "remove_notes" / "add_notes", applies those first. Then
+reads every note in the open piano roll and writes them as JSON to
 piano_roll_state.json next to this script. The MCP server's get_notes tool
 triggers it with Ctrl+Alt+Y ("Run last script again"), so run it once by hand
 first: piano roll menu > Tools > Scripting > ExportNotes.
@@ -22,12 +23,42 @@ REQUEST_FILE = os.path.join(SCRIPT_DIR, "export_request.json")
 STATE_FILE = os.path.join(SCRIPT_DIR, "piano_roll_state.json")
 
 
-def read_request_id():
+def read_json(path):
     try:
-        with open(REQUEST_FILE, "r") as f:
-            return json.load(f).get("id")
+        with open(path, "r") as f:
+            return json.load(f)
     except Exception:
-        return None  # run by hand, or no request file
+        return {}  # run by hand, or no file yet
+
+
+def remove_requested_notes(request):
+    """Delete the request's "remove_notes" ({note, start in beats}): one matching note
+    per entry. Returns how many were removed."""
+    ppq = flp.score.PPQ
+    removed = 0
+    for r in request.get("remove_notes") or []:
+        ticks = int(round(r["start"] * ppq))
+        for i in range(flp.score.noteCount - 1, -1, -1):
+            n = flp.score.getNote(i)
+            if n.number == int(r["note"]) and abs(n.time - ticks) <= 1:
+                flp.score.deleteNote(i)
+                removed += 1
+                break
+    return removed
+
+
+def add_requested_notes(request):
+    """Add the request's "add_notes" ({note, start, length in beats, velocity 0-127})"""
+    if not request.get("add_notes"):
+        return
+    ppq = flp.score.PPQ
+    for n in request["add_notes"]:
+        note = flp.Note()
+        note.number = int(n["note"])
+        note.time = int(round(n["start"] * ppq))
+        note.length = int(round(n["length"] * ppq))
+        note.velocity = n.get("velocity", 100) / 128
+        flp.score.addNote(note)
 
 
 def collect_notes():
@@ -55,7 +86,14 @@ def collect_notes():
 
 
 def apply(form=None):
+    request = read_json(REQUEST_FILE)
+    removed = 0
+    # Skip edits for a request that was already handled (its id is in the last export)
+    if request.get("id") and read_json(STATE_FILE).get("request_id") != request.get("id"):
+        removed = remove_requested_notes(request)
+        add_requested_notes(request)
     data = collect_notes()
-    data["request_id"] = read_request_id()
+    data["request_id"] = request.get("id")
+    data["removed"] = removed
     with open(STATE_FILE, "w") as f:
         json.dump(data, f)

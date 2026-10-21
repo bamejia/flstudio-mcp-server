@@ -9,6 +9,7 @@
 import math
 
 import channels
+import general
 import midi
 import mixer
 import patterns
@@ -41,16 +42,19 @@ def find_patterns(pattern):
     return matches
 
 def find_channel(name):
-    """Global channel index for a channel name (case-insensitive) or a global index (int)"""
+    """Global channel index for a channel name (case-insensitive) or a global index
+    (an int, or a string of digits that isn't also a channel's name)"""
     names = [channels.getChannelName(c, True) for c in range(channels.channelCount(True))]
-    if isinstance(name, int):
-        if not 0 <= name < len(names):
-            raise ValueError(f"Channel index {name} doesn't exist (0-{len(names) - 1})")
-        return name
-    for c, channel_name in enumerate(names):
-        if channel_name.lower() == str(name).lower():
-            return c
-    raise ValueError(f"No channel named {name!r}. Channels: {names}")
+    if not isinstance(name, int):
+        for c, channel_name in enumerate(names):
+            if channel_name.lower() == str(name).lower():
+                return c
+        if not str(name).strip().isdigit():
+            raise ValueError(f"No channel named {name!r}. Channels: {names}")
+    index = int(name)
+    if not 0 <= index < len(names):
+        raise ValueError(f"Channel index {index} doesn't exist (0-{len(names) - 1})")
+    return index
 
 def channel_data(c, fields, step_count):
     """Data for one channel (global index); steps are read from the active pattern"""
@@ -99,6 +103,10 @@ def req_get_pattern(pattern, channel=None, fields=("info", "mixer", "steps")):
     channel_indexes = [find_channel(channel)] if channel else list(range(channels.channelCount(True)))
     return [read_pattern(p, channel_indexes, set(fields)) for p in find_patterns(pattern)]
 
+def req_get_channel(channel, fields=("info", "mixer")):
+    """One channel's settings (no pattern needed: steps aren't included)"""
+    return channel_data(find_channel(channel), set(fields) - {"steps"}, 0)
+
 def req_get_all_patterns(fields=("info", "mixer", "steps")):
     channel_indexes = list(range(channels.channelCount(True)))
     return [read_pattern(p, channel_indexes, set(fields)) for p in used_patterns()]
@@ -123,12 +131,10 @@ def req_get_plugin_params(channel, name_filter="", limit=200):
 
 def req_prepare_piano_roll(channel, pattern=None):
     """
-    Show one channel's piano roll for a pattern and focus it, so the server's
-    Ctrl+Alt+Y can run the ExportNotes piano roll script on it. Returns the
-    focused window caption (FL reports just "Piano roll -", without the channel)
-    for the server to check that the piano roll has focus, the channel's step
-    positions (the server's cross-check that the right channel was exported) and
-    the selection to restore afterwards.
+    Select the pattern and channel whose notes the server is about to export.
+    The piano roll itself is opened later by focus_piano_roll, once FL Studio is
+    in front. Returns the channel's step positions (the server's cross-check that
+    the right channel was exported) and the selection to restore afterwards.
     """
     c = find_channel(channel)
     p = find_patterns(pattern)[0] if pattern not in (None, "") else patterns.patternNumber()
@@ -136,20 +142,38 @@ def req_prepare_piano_roll(channel, pattern=None):
     if p != patterns.patternNumber():
         patterns.jumpToPattern(p)
     channels.selectOneChannel(c, True)
-    name = channels.getChannelName(c, True)
-    ui.showWindow(midi.widPianoRoll)
-    ui.setFocused(midi.widPianoRoll)
-    caption = ui.getFocusedFormCaption()
     step_count = int(patterns.getPatternLength(p) * 4)
-    return {"pattern": p, "pattern_name": patterns.getPatternName(p), "channel": c, "channel_name": name,
-            "caption": caption, "steps_on": [s for s in range(step_count) if channels.getGridBit(c, s, True)],
+    return {"pattern": p, "pattern_name": patterns.getPatternName(p), "channel": c,
+            "channel_name": channels.getChannelName(c, True),
+            "steps_on": [s for s in range(step_count) if channels.getGridBit(c, s, True)],
             "restore": restore}
 
-def req_focus_piano_roll():
-    """Focus the piano roll again once FL Studio is on screen (focus set while minimized doesn't stick)"""
-    ui.showWindow(midi.widPianoRoll)
-    ui.setFocused(midi.widPianoRoll)
-    return ui.getFocusedFormCaption()
+def req_piano_roll_step(action):
+    """
+    One step of opening the selected channel's piano roll, driven by the server
+    once FL Studio is in front. showWindow alone keeps whatever channel the piano
+    roll last showed; closing it and reopening it with F7 (FPT_F7) switches it to
+    the selected channel. FL applies window changes only after a request returns,
+    so the server sends each step separately and checks the state in between.
+      "show"  - open the piano roll (as it is)
+      "hide"  - close it
+      "f7"    - toggle it like the F7 key (reopens it on the selected channel)
+      "focus" - make it FL's focused window
+      "state" - change nothing
+    Returns whether it's open and the focused window caption (FL's piano roll
+    caption is just "Piano roll -", without the channel name).
+    """
+    if action == "show":
+        ui.showWindow(midi.widPianoRoll)
+    elif action == "hide":
+        ui.hideWindow(midi.widPianoRoll)
+    elif action == "f7":
+        transport.globalTransport(midi.FPT_F7, 1)
+    elif action == "focus":
+        ui.setFocused(midi.widPianoRoll)
+    elif action != "state":
+        raise ValueError(f"Unknown piano roll step {action!r}")
+    return {"visible": bool(ui.getVisible(midi.widPianoRoll)), "caption": ui.getFocusedFormCaption()}
 
 def req_restore_selection(pattern, channel):
     """Put back the pattern and selected channel that were active before prepare_piano_roll"""
@@ -205,11 +229,25 @@ def req_get_mixer_track(track):
                      if channels.getTargetFxTrack(c, True) == t],
     }
 
+def req_undo_state():
+    """Undo history position: 0 = most recent action, higher = further back;
+    hint is FL's "position/length" text"""
+    return {"position": general.getUndoHistoryLast(), "hint": general.getUndoLevelHint()}
+
+def req_undo_move(delta):
+    """Move through the undo history: negative undoes, positive redoes (per the API
+    docs; the server checks the direction, since FL 21 swapped related functions)"""
+    general.undoUpDown(delta)
+    return True
+
 REQUEST_HANDLERS = {
+    "undo_state": req_undo_state,
+    "undo_move": req_undo_move,
     "ping": lambda: "pong",
     "get_mixer_track": req_get_mixer_track,
+    "get_channel": req_get_channel,
     "prepare_piano_roll": req_prepare_piano_roll,
-    "focus_piano_roll": req_focus_piano_roll,
+    "piano_roll_step": req_piano_roll_step,
     "restore_selection": req_restore_selection,
     "get_pattern_names": req_get_pattern_names,
     "get_channel_names": req_get_channel_names,

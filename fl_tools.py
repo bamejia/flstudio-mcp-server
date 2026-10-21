@@ -103,6 +103,8 @@ def change_tempo(bpm: float):
 
     Args:
         bpm (float): The desired tempo in beats per minute (20-999)
+
+    Returns the tempo FL Studio reports afterwards, so the change can be checked.
     """
     # Ensure BPM is within a reasonable range
     if bpm < 20 or bpm > 999:
@@ -115,20 +117,20 @@ def change_tempo(bpm: float):
     send(Message('control_change', control=CC_TEMPO_LSB, value=bpm_int & 0x7F))
 
     time.sleep(0.2)  # Give FL Studio a moment to apply it
-    return f"Tempo change to {bpm_int} BPM sent to FL Studio. {get_tempo()}"
+    return get_tempo()
 
 def get_tempo(timeout: float = 2.0):
     """
     Read the current project tempo from FL Studio
 
     Sends a request CC; the FL Studio script replies with BPM * 10 as two CC
-    messages on the input port.
+    messages on the input port. Returns the tempo in BPM.
 
     Args:
         timeout (float): Seconds to wait for FL Studio's reply
     """
     if not ensure_listener():
-        return f"No MIDI input named '{INPUT_PORT_NAME}'. Available inputs: {mido.get_input_names()}"
+        raise FLStudioError(f"No MIDI input named '{INPUT_PORT_NAME}'. Available inputs: {mido.get_input_names()}")
 
     # Drop any stale replies left over from earlier requests
     while not tempo_replies.empty():
@@ -146,10 +148,11 @@ def get_tempo(timeout: float = 2.0):
         if msg.control == CC_TEMPO_REPLY_MSB:
             msb = msg.value
         elif msg.control == CC_TEMPO_REPLY_LSB and msb is not None:
-            return f"Current FL Studio tempo: {((msb << 7) | msg.value) / 10:g} BPM"
+            bpm = ((msb << 7) | msg.value) / 10
+            return int(bpm) if bpm.is_integer() else bpm
 
-    return (f"No tempo reply from FL Studio within {timeout}s. Check that FL Studio's MIDI output "
-            f"'{INPUT_PORT_NAME}' is enabled with the same port number as the Test Controller input.")
+    raise FLStudioError(f"No tempo reply from FL Studio within {timeout}s. Check that FL Studio's MIDI output "
+                        f"'{INPUT_PORT_NAME}' is enabled with the same port number as the Test Controller input.")
 
 def get_fl_log(lines: int = 50, contains: str = "", clear: bool = False):
     """
@@ -172,126 +175,219 @@ def get_fl_log(lines: int = 50, contains: str = "", clear: bool = False):
                 "(MIDI Settings) to make it print, and check that the 'loopMIDI Port' output is enabled.")
     return "\n".join(f"{time.strftime('%H:%M:%S', time.localtime(t))}  {text}" for t, text in entries)
 
-DEFAULT_FIELDS = ("info", "mixer", "steps")
-CHANNEL_FIELDS = DEFAULT_FIELDS + ("notes",)  # notes are opt-in: reading them focuses FL Studio
+# --- Reading and editing the project ------------------------------------------
+# Tools return only what was asked for, to keep responses small: callers pick
+# fields, a single requested value comes back bare, results are keyed by name
+# instead of repeating index/name/metadata, and defaults are left out.
 
-def check_fields(fields):
-    fields = list(fields or DEFAULT_FIELDS)
-    unknown = [f for f in fields if f not in CHANNEL_FIELDS]
+CHANNEL_FIELD_GROUPS = {
+    "info": ("type", "plugin", "mixer_track"),
+    "mixer": ("volume", "volume_db", "pan", "pitch_cents", "muted", "solo"),
+    "steps": ("steps",),
+    "notes": ("notes",),  # opt-in: reading notes brings FL Studio to the front
+}
+CHANNEL_FIELDS = tuple(f for group in CHANNEL_FIELD_GROUPS.values() for f in group)
+
+def expand_fields(fields, default_groups):
+    """Requested fields (individual names and/or group names) as a list of individual fields"""
+    expanded = []
+    for f in fields or default_groups:
+        expanded.extend(CHANNEL_FIELD_GROUPS.get(f, (f,)))
+    unknown = [f for f in expanded if f not in CHANNEL_FIELDS]
     if unknown:
-        raise ValueError(f"Unknown fields {unknown}. Choose from {list(CHANNEL_FIELDS)}")
-    return fields
+        raise ValueError(f"Unknown fields {unknown}. Choose from {list(CHANNEL_FIELDS)} "
+                         f"or the groups {list(CHANNEL_FIELD_GROUPS)}")
+    return list(dict.fromkeys(expanded))
+
+def fl_groups(fields):
+    """Field groups the FL script has to compute: notes are read separately and
+    need the step grid to find the channels that have any"""
+    groups = [g for g, members in CHANNEL_FIELD_GROUPS.items()
+              if g != "notes" and any(f in members for f in fields)]
+    if "notes" in fields and "steps" not in groups:
+        groups.append("steps")
+    return groups
+
+def pick(data, fields):
+    """Just the requested fields: a bare value for one field, else a dict"""
+    return data[fields[0]] if len(fields) == 1 else {f: data[f] for f in fields}
+
+def labels(items, name_key, id_key):
+    """Names to key results by; a name used more than once gets its id appended"""
+    names = [item[name_key] for item in items]
+    return [n if names.count(n) == 1 else f"{n} #{item[id_key]}" for n, item in zip(names, items)]
 
 NOTE_NAMES = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 # Piano roll note properties at their defaults are left out of results to save space
-NOTE_DEFAULTS = {"pan": 0.5, "release": 0.5, "fcut": 0.5, "fres": 0.5, "pitchofs": 0, "color": 0,
-                 "slide": False, "porta": False, "muted": False}
+NOTE_DEFAULTS = {"velocity": 100, "pan": 0.5, "release": 0.5, "fcut": 0.5, "fres": 0.5, "pitchofs": 0,
+                 "color": 0, "slide": False, "porta": False, "muted": False}
 
 def compact_note(n, ppq):
     note = {
-        "note": n["number"],
-        "name": f"{NOTE_NAMES[n['number'] % 12]}{n['number'] // 12}",  # FL Studio naming: 60 = C5
+        "note": n["number"],                          # MIDI number; FL Studio names 60 as C5
         "start": round(n["time_ticks"] / ppq, 4),     # beats from the pattern start
         "length": round(n["length_ticks"] / ppq, 4),  # beats
-        "velocity": min(127, round(n["velocity"] * 128)),  # FL's 0-1 velocity as MIDI 0-127
     }
+    values = dict(n, velocity=min(127, round(n["velocity"] * 128)))  # FL's 0-1 velocity as MIDI 0-127
     for key, default in NOTE_DEFAULTS.items():
-        value = n[key]
+        value = values[key]
         if (abs(value - default) > 0.01) if isinstance(default, float) else value != default:
             note[key] = round(value, 3) if isinstance(value, float) else value
     return note
 
-def read_notes(channel, pattern=None):
-    """Export one channel's piano roll notes in a pattern (channel: name or global index)"""
+def read_notes(channel, pattern=None, new_notes=None, removed_notes=None):
+    """Export one channel's piano roll notes in a pattern (channel: name or global index),
+    after removing removed_notes ({note, start}) and adding new_notes ({note, start,
+    length, velocity}) if given. Returns {"notes", "removed", "warnings"}."""
     prep = fl_request("prepare_piano_roll", channel=channel, pattern=pattern)
+    debug_trail = []
+
+    def step(action, want_open=None, timeout=1.5):
+        """Send one piano roll step; FL applies it after the request returns, so poll for the result"""
+        state = fl_request("piano_roll_step", action=action)
+        deadline = time.time() + timeout
+        while want_open is not None and state["visible"] != want_open and time.time() < deadline:
+            time.sleep(0.05)
+            state = fl_request("piano_roll_step", action="state")
+        debug_trail.append(f"{action}: open={state['visible']} focused={state['caption']!r}")
+        return state
+
+    def open_piano_roll():
+        # Runs once FL Studio is in front (doing this while FL is in the background
+        # stops Windows from bringing it forward). showWindow alone keeps the channel
+        # the piano roll last showed; closing it and reopening it with F7 switches it
+        # to the selected channel. FL's caption is just "Piano roll -", so this only
+        # checks the piano roll has focus; the step-grid comparison below checks the channel.
+        step("show", want_open=True)
+        step("hide", want_open=False)
+        if not step("f7", want_open=True)["visible"]:
+            raise FLStudioError(f"FL Studio's piano roll didn't reopen. Steps: {debug_trail}")
+        step("focus")
+        time.sleep(0.1)
+        caption = step("state")["caption"]
+        if not caption.lower().startswith("piano roll"):
+            raise FLStudioError(f"FL Studio's piano roll didn't get focus (focused window: {caption!r}). "
+                                f"Steps: {debug_trail}")
+
+    warnings = []
     try:
-        # FL's caption is just "Piano roll -" (no channel name), so this only checks the
-        # piano roll has focus; the step-grid comparison below checks the channel
-        if not prep["caption"].lower().startswith("piano roll"):
-            raise FLStudioError(f"FL Studio's piano roll didn't get focus (focused window: {prep['caption']!r})")
-        # Re-focus the piano roll once FL is on screen: focus set while it was minimized doesn't stick
-        window_warnings = []
-        state = run_export_notes(before_shortcut=lambda: fl_request("focus_piano_roll"),
-                                 window_warnings=window_warnings)
+        try:
+            edits = {key: value for key, value in (("add_notes", new_notes), ("remove_notes", removed_notes)) if value}
+            state = run_export_notes(before_shortcut=open_piano_roll, window_warnings=warnings,
+                                     request=edits or None)
+        except FLStudioError as e:
+            raise FLStudioError(f"{e} Steps: {debug_trail}") if debug_trail and "Steps:" not in str(e) else e
     finally:
         fl_request("restore_selection", **prep["restore"])
     ppq = state["ppq"]
-    result = {"pattern": prep["pattern"], "pattern_name": prep["pattern_name"], "channel": prep["channel_name"],
-              "notes": sorted((compact_note(n, ppq) for n in state["notes"]), key=lambda n: (n["start"], n["note"]))}
-    # FL's step grid marks the step each note starts on; a mismatch suggests the wrong piano roll was read
+    notes = sorted((compact_note(n, ppq) for n in state["notes"]), key=lambda n: (n["start"], n["note"]))
+    removed = state.get("removed", 0)
+    if removed_notes and removed < len(removed_notes):
+        warnings.append(f"Only {removed} of {len(removed_notes)} notes were found and removed "
+                        "(matched by note number and start).")
+    # FL's step grid marks the step each note starts on; a mismatch suggests the wrong piano
+    # roll was read. The grid was read before any edits, so expect the added notes' steps too;
+    # a removed note may empty its step, so with removals the notes only have to fit in the grid.
     note_steps = sorted({n["time_ticks"] * 4 // ppq for n in state["notes"]})
-    if note_steps != prep["steps_on"]:
-        result["warning"] = (f"Note start steps {note_steps} don't match the channel's step grid "
-                             f"{prep['steps_on']}; the export may come from a different piano roll.")
-    if window_warnings:
-        result["window_warning"] = "; ".join(window_warnings)
-    return result
+    expected_steps = sorted(set(prep["steps_on"]) | {int(n["start"] * 4) for n in new_notes or []})
+    if (not set(note_steps) <= set(expected_steps)) if removed_notes else note_steps != expected_steps:
+        warnings.append(f"{prep['channel_name']}: note start steps {note_steps} don't match the step grid "
+                        f"{expected_steps}; the export may come from a different piano roll.")
+    return {"notes": notes, "removed": removed, "warnings": warnings}
 
-def add_notes(patterns_data, keep_steps):
-    """Add piano roll notes to get_pattern/get_all_patterns results, for channels that have any"""
-    for pattern in patterns_data:
-        for channel in pattern["channels"]:
-            # The step grid marks every note start, so channels without steps have no notes
-            channel["notes"] = read_notes(channel["index"], pattern["pattern"])["notes"] if channel["steps_on"] else []
-            if not keep_steps:
-                del channel["steps_on"]
-    return patterns_data
+def with_warnings(result, warnings):
+    """Attach warnings only when there are any"""
+    return {"result": result, "warnings": warnings} if warnings else result
 
-def request_fields(fields):
-    """Fields to ask the FL script for: notes are read separately and need steps to find channels with notes"""
-    asked = [f for f in fields if f != "notes"]
-    if "notes" in fields and "steps" not in asked:
-        asked.append("steps")
-    return asked
+def shape_patterns(data, fields, single_channel):
+    """Shape FL's get_pattern / get_all_patterns data: {pattern: {channel: picked fields}}
+    (or just the picked fields for a single channel), reading notes if asked for"""
+    warnings = []
+    content_only = set(fields) <= {"steps", "notes"}
+    shaped = {}
+    for pattern, pattern_label in zip(data, labels(data, "name", "pattern")):
+        channels = {}
+        for ch, channel_label in zip(pattern["channels"], labels(pattern["channels"], "name", "index")):
+            ch["steps"] = ch.pop("steps_on", None)
+            if "notes" in fields:
+                # The step grid marks every note start, so channels without steps have no notes
+                read = read_notes(ch["index"], pattern["pattern"]) if ch["steps"] else {"notes": [], "warnings": []}
+                ch["notes"] = read["notes"]
+                warnings.extend(read["warnings"])
+            if content_only and not single_channel and not any(ch[f] for f in fields):
+                continue
+            channels[channel_label] = pick(ch, fields)
+        shaped[pattern_label] = next(iter(channels.values()), None) if single_channel else channels
+    return shaped, warnings
 
 def get_pattern_names():
-    """List every non-empty pattern in the FL Studio project: number, name and length in beats"""
-    return fl_request("get_pattern_names")
+    """List the names of every non-empty pattern in the FL Studio project"""
+    data = fl_request("get_pattern_names")
+    return labels(data, "name", "pattern")
 
 def get_channel_names():
-    """List every channel in the channel rack: global index, name and plugin (None for audio samples)"""
-    return fl_request("get_channel_names")
+    """List the names of every channel in the channel rack, in channel rack order"""
+    data = fl_request("get_channel_names")
+    return labels(data, "name", "index")
+
+def get_channel(channel: str, fields: list[str] | None = None):
+    """
+    Read a channel's settings (the same in every pattern)
+
+    Args:
+        channel (str): Channel name (case-insensitive), or its position in the channel rack (0 = first)
+        fields (list[str]): Any of "type", "plugin", "mixer_track", "volume", "volume_db",
+            "pan" (-1 left .. 1 right), "pitch_cents", "muted", "solo", or the groups
+            "info" (type, plugin, mixer_track) and "mixer" (volume .. solo).
+            Default: info and mixer.
+
+    One field returns just its value (e.g. ["mixer_track"] -> 0); several return a dict.
+    """
+    fields = expand_fields(fields, ("info", "mixer"))
+    if any(f in ("steps", "notes") for f in fields):
+        raise ValueError("Steps and notes belong to a pattern: use get_pattern or get_notes")
+    return pick(fl_request("get_channel", channel=channel, fields=fl_groups(fields)), fields)
 
 def get_pattern(pattern: str, channel: str = "", fields: list[str] | None = None):
     """
     Read a pattern's per-channel data from FL Studio
 
     Args:
-        pattern (str): Pattern name (case-insensitive) or number. If several patterns
-                       share the name, all of them are returned.
-        channel (str): Only return this channel (by name). Empty returns every channel.
-        fields (list[str]): Which data to include for each channel; any of
-            "info"  - channel type, plugin name, mixer track
-            "mixer" - volume (0-1 and dB), pan (-1 left .. 1 right), pitch (cents), mute, solo
-            "steps" - step sequencer steps that are on (16th-note step numbers from 0)
-            "notes" - piano roll notes, as in get_notes (opt-in: FL Studio comes to the
-                      front and opens each channel's piano roll while they're read)
-            Default: info, mixer, steps. Asking for only "steps" and/or "notes" also
-            leaves out channels with nothing in the pattern.
+        pattern (str): Pattern name (case-insensitive) or number
+        channel (str): Only this channel (name, or position in the channel rack). Empty for all.
+        fields (list[str]): Any of the get_channel fields, plus "steps" (step sequencer steps
+            that are on, 16th-note step numbers from 0) and "notes" (piano roll notes as in
+            get_notes; opt-in, FL Studio comes to the front while each channel is read).
+            Groups: "info", "mixer", "steps", "notes". Default: info, mixer, steps.
 
-    Reading steps briefly switches FL Studio to that pattern and back.
+    Returns {channel: value} with each value just the requested field (or a dict of
+    several); with a channel given, just that channel's value. Asking only for steps
+    and/or notes leaves out channels with nothing in the pattern. If several patterns
+    share the name, the result is keyed by pattern too. Reading steps briefly switches
+    FL Studio to that pattern and back.
     """
-    fields = check_fields(fields)
-    result = fl_request("get_pattern", pattern=pattern, channel=channel or None, fields=request_fields(fields))
-    return add_notes(result, "steps" in fields) if "notes" in fields else result
+    fields = expand_fields(fields, ("info", "mixer", "steps"))
+    data = fl_request("get_pattern", pattern=pattern, channel=channel or None, fields=fl_groups(fields))
+    shaped, warnings = shape_patterns(data, fields, single_channel=bool(channel))
+    return with_warnings(shaped if len(shaped) > 1 else next(iter(shaped.values())), warnings)
 
 def get_all_patterns(fields: list[str] | None = None):
     """
     Read every non-empty pattern's per-channel data from FL Studio
 
     Args:
-        fields (list[str]): Same as get_pattern: any of "info", "mixer", "steps", "notes"
-                            (default: info, mixer, steps). "info" and "mixer" are the same
-                            for every pattern, so ["steps"] is the cheapest way to see what
-                            each pattern contains. "notes" reads every channel's piano roll
-                            in every pattern, one at a time, so it is slow.
+        fields (list[str]): Same as get_pattern (default: ["steps"], the cheapest way to see
+            what each pattern contains; channel settings are the same in every pattern, so
+            read those with get_channel). "notes" reads every channel's piano roll in every
+            pattern, one at a time, so it is slow.
 
-    Steps are read by switching FL Studio through each pattern, then back to the
-    one that was active.
+    Returns {pattern: {channel: value}}. Steps are read by switching FL Studio through
+    each pattern, then back to the one that was active.
     """
-    fields = check_fields(fields)
-    result = fl_request("get_all_patterns", timeout=60.0, fields=request_fields(fields))
-    return add_notes(result, "steps" in fields) if "notes" in fields else result
+    fields = expand_fields(fields, ("steps",))
+    data = fl_request("get_all_patterns", timeout=60.0, fields=fl_groups(fields))
+    shaped, warnings = shape_patterns(data, fields, single_channel=False)
+    return with_warnings(shaped, warnings)
 
 def get_notes(channel: str, pattern: str = ""):
     """
@@ -301,31 +397,132 @@ def get_notes(channel: str, pattern: str = ""):
         channel (str): Channel name (case-insensitive)
         pattern (str): Pattern name or number; empty uses the active pattern
 
-    Each note has its MIDI number, name (FL Studio naming, 60 = C5), start and
-    length in beats from the pattern start, and velocity (0-127). Pan, release,
-    filter, fine pitch, color, slide, porta and mute are only included when not
-    at their defaults.
+    Returns a list of notes: {"note": MIDI number (FL Studio names 60 as C5), "start"
+    and "length" in beats from the pattern start}, plus velocity (0-127), pan, release,
+    filter, fine pitch, color, slide, porta or muted only where not at their defaults
+    (velocity 100).
 
     How it works: FL Studio is brought to the front with that channel's piano roll
     open, the ExportNotes piano roll script is run with Ctrl+Alt+Y ("Run last script
-    again") and focus goes back afterwards. ExportNotes must be the last piano roll
-    script run in FL Studio; otherwise Ctrl+Alt+Y runs a different script.
+    again") and focus and window order are put back afterwards. ExportNotes must be
+    the last piano roll script run in FL Studio; otherwise Ctrl+Alt+Y runs a different one.
     """
-    return read_notes(channel, pattern or None)
+    read = read_notes(channel, pattern or None)
+    return with_warnings(read["notes"], read["warnings"])
 
-def get_mixer_track(track: str):
+def add_notes(channel: str, notes: list[dict], pattern: str = "", return_notes: bool = False):
+    """
+    Add notes to one channel's piano roll in a pattern
+
+    Args:
+        channel (str): Channel name (case-insensitive)
+        notes (list[dict]): Notes to add, each {"note": MIDI number (60 = C5 in FL
+            naming), "start": beats from the pattern start, "length": beats,
+            "velocity": 0-127 (default 100)}
+        pattern (str): Pattern name or number; empty uses the active pattern
+        return_notes (bool): Also return all of the channel's notes afterwards
+
+    Existing notes are kept (calling it twice adds the notes twice). Returns
+    {"added", "total"}; the export afterwards is checked against FL's step grid and
+    any problem is returned as a warning. Works like get_notes (FL Studio comes to the
+    front briefly). Undo in FL Studio with Ctrl+Z.
+    """
+    for n in notes:
+        if not 0 <= int(n["note"]) <= 127 or n["start"] < 0 or n["length"] < 0:
+            raise ValueError(f"Invalid note {n}: note must be 0-127, start and length at least 0")
+    read = read_notes(channel, pattern or None, new_notes=notes)
+    result = {"added": len(notes), "total": len(read["notes"])}
+    if return_notes:
+        result["notes"] = read["notes"]
+    return with_warnings(result, read["warnings"])
+
+def remove_notes(channel: str, notes: list[dict], pattern: str = "", return_notes: bool = False):
+    """
+    Remove notes from one channel's piano roll in a pattern
+
+    Args:
+        channel (str): Channel name (case-insensitive)
+        notes (list[dict]): Notes to remove, each {"note": MIDI number (60 = C5 in FL
+            naming), "start": beats from the pattern start}. Each entry removes one
+            matching note; other notes are left alone.
+        pattern (str): Pattern name or number; empty uses the active pattern
+        return_notes (bool): Also return all of the channel's notes afterwards
+
+    Returns {"removed", "total"} (a warning if some notes weren't found). Works like
+    get_notes (FL Studio comes to the front briefly). Undo in FL Studio with Ctrl+Z.
+    """
+    for n in notes:
+        if not 0 <= int(n["note"]) <= 127 or n["start"] < 0:
+            raise ValueError(f"Invalid note {n}: note must be 0-127 and start at least 0")
+    read = read_notes(channel, pattern or None, removed_notes=notes)
+    result = {"removed": read["removed"], "total": len(read["notes"])}
+    if return_notes:
+        result["notes"] = read["notes"]
+    return with_warnings(result, read["warnings"])
+
+def move_history(steps, undo):
+    """Undo (or redo) steps actions and return FL's "position/length" hint. The API
+    says negative undoes, but FL 21 swapped related functions, so check which way the
+    position moved (0 = most recent, higher = further back) and correct a wrong move."""
+    if steps < 1:
+        raise ValueError("steps must be at least 1")
+    delta = -steps if undo else steps
+    before = fl_request("undo_state")["position"]
+    fl_request("undo_move", delta=delta)
+    after = fl_request("undo_state")
+    if after["position"] != before and (after["position"] > before) != undo:
+        fl_request("undo_move", delta=-2 * delta)  # went the wrong way: go back past the start
+        after = fl_request("undo_state")
+    return after["hint"]
+
+def undo(steps: int = 1):
+    """
+    Undo the last actions in FL Studio (step back through its undo history)
+
+    Args:
+        steps (int): How many actions to undo
+
+    Returns FL's undo position as "position/length" (1 = most recent action).
+    Each add_notes / remove_notes call is one action.
+    """
+    return move_history(steps, undo=True)
+
+def redo(steps: int = 1):
+    """
+    Redo actions undone with undo (step forward through FL Studio's undo history)
+
+    Args:
+        steps (int): How many actions to redo
+
+    Returns FL's undo position as "position/length" (1 = most recent action).
+    """
+    return move_history(steps, undo=False)
+
+MIXER_TRACK_FIELDS = ("name", "volume", "volume_db", "pan", "stereo_separation", "muted", "solo",
+                      "armed", "effects_enabled", "effects", "sends_to", "channels")
+
+def get_mixer_track(track: str, fields: list[str] | None = None):
     """
     Read a mixer track from FL Studio
 
     Args:
-        track (str): Mixer track number (0 = Master; the same number get_pattern
-                     reports as a channel's "mixer_track") or track name (case-insensitive)
+        track (str): Mixer track number (0 = Master; the number get_channel reports as
+                     "mixer_track") or track name (case-insensitive)
+        fields (list[str]): Any of "name", "volume" (0-1), "volume_db", "pan" (-1 left ..
+            1 right), "stereo_separation", "muted", "solo", "armed", "effects_enabled",
+            "effects" ({slot: plugin}), "sends_to" ({track: send level}), "channels"
+            (channels routed into it). Default: all.
 
-    Returns the track's name, volume (0-1 and dB), pan (-1 left .. 1 right), stereo
-    separation, mute/solo/arm state, the effect plugins in its slots, the tracks it
-    sends to (with send level) and the channels routed into it.
+    One field returns just its value; several return a dict.
     """
-    return fl_request("get_mixer_track", track=track)
+    fields = list(fields or MIXER_TRACK_FIELDS)
+    unknown = [f for f in fields if f not in MIXER_TRACK_FIELDS]
+    if unknown:
+        raise ValueError(f"Unknown fields {unknown}. Choose from {list(MIXER_TRACK_FIELDS)}")
+    data = fl_request("get_mixer_track", track=track)
+    data["effects"] = {str(e["slot"]): e.get("name", e["plugin"]) for e in data["effects"]}
+    data["sends_to"] = {s["name"]: s["level"] for s in data["sends_to"]}
+    return pick(data, fields)
 
 def get_plugin_params(channel: str, name_filter: str = "", limit: int = 200):
     """
@@ -333,15 +530,19 @@ def get_plugin_params(channel: str, name_filter: str = "", limit: int = 200):
 
     Args:
         channel (str): Channel name (case-insensitive)
-        name_filter (str): Only return parameters whose name contains this text (case-insensitive)
+        name_filter (str): Only parameters whose name contains this text (case-insensitive)
         limit (int): Maximum number of parameters to return
 
-    Each parameter has its index, name, normalized value (0-1) and, where the
-    plugin provides it, a display string such as "-6.0 dB". Unnamed VST slots
-    and MIDI CC mappings are skipped. FL Studio doesn't expose default values,
-    so this can't tell which settings were changed.
+    Returns {parameter name: value}, the value being the plugin's display text (such
+    as "-6.0 dB") where it provides one, else the normalized 0-1 value; "_more": true
+    when the limit cut the list short. Unnamed VST slots and MIDI CC mappings are
+    skipped. FL Studio doesn't expose defaults, so this can't tell which were changed.
     """
-    return fl_request("get_plugin_params", timeout=30.0, channel=channel, name_filter=name_filter, limit=limit)
+    data = fl_request("get_plugin_params", timeout=30.0, channel=channel, name_filter=name_filter, limit=limit)
+    params = {p["name"]: p["display"] if p["display"] is not None else p["value"] for p in data["params"]}
+    if data["returned"] >= limit:
+        params["_more"] = True
+    return params
 
 def send_melody(notes_data):
     """
@@ -443,6 +644,6 @@ def after_reload():
 
 TOOLS = [
     list_midi_ports, play, stop, change_tempo, get_tempo, get_fl_log,
-    get_pattern_names, get_channel_names, get_pattern, get_all_patterns, get_notes,
+    get_pattern_names, get_channel_names, get_channel, get_pattern, get_all_patterns, get_notes, add_notes, remove_notes, undo, redo,
     get_mixer_track, get_plugin_params, send_melody, send_midi_note,
 ]
