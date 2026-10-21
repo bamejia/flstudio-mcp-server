@@ -28,29 +28,47 @@ def used_patterns():
     """Pattern numbers (1-based) that have been changed from the empty default"""
     return [p for p in range(1, patterns.patternMax() + 1) if not patterns.isPatternDefault(p)]
 
+def match_names(query, names):
+    """Positions of the names matching query (case-insensitive): the exact matches, else
+    the names starting with it, so a short start like "elec" finds "Electric"."""
+    query = str(query).strip().lower()
+    exact = [i for i, n in enumerate(names) if n.lower() == query]
+    return exact or ([i for i, n in enumerate(names) if n.lower().startswith(query)] if query else [])
+
+def no_match(kind, query, names, matches):
+    """Error for a name that matched nothing or more than one thing (lists capped at 10)"""
+    if matches:
+        return ValueError(f"{query!r} matches several {kind}s: {[names[i] for i in matches][:10]}")
+    return ValueError(f"No {kind} named {query!r}. {kind.capitalize()}s: {names[:10]}"
+                      + (f" (+{len(names) - 10} more)" if len(names) > 10 else ""))
+
 def find_patterns(pattern):
-    """Pattern numbers matching a name (case-insensitive) or a pattern number"""
+    """Pattern numbers matching a pattern number, or a name or its start (case-insensitive).
+    Several patterns may share a name, but a start must not fit different names."""
     used = used_patterns()
     if isinstance(pattern, int) or str(pattern).strip().isdigit():
         number = int(pattern)
         if number not in used:
             raise ValueError(f"Pattern {number} doesn't exist or is empty")
         return [number]
-    matches = [p for p in used if patterns.getPatternName(p).lower() == str(pattern).lower()]
-    if not matches:
-        raise ValueError(f"No pattern named {pattern!r}. Patterns: {[patterns.getPatternName(p) for p in used]}")
-    return matches
+    names = [patterns.getPatternName(p) for p in used]
+    matches = match_names(pattern, names)
+    if not matches or len({names[i].lower() for i in matches}) > 1:
+        raise no_match("pattern", pattern, names, matches)
+    return [used[i] for i in matches]
 
 def find_channel(name):
-    """Global channel index for a channel name (case-insensitive) or a global index
-    (an int, or a string of digits that isn't also a channel's name)"""
+    """Global channel index for a channel name or its start (case-insensitive), or a global
+    index (an int, or a string of digits that isn't also a channel's name)"""
     names = [channels.getChannelName(c, True) for c in range(channels.channelCount(True))]
     if not isinstance(name, int):
-        for c, channel_name in enumerate(names):
-            if channel_name.lower() == str(name).lower():
-                return c
-        if not str(name).strip().isdigit():
-            raise ValueError(f"No channel named {name!r}. Channels: {names}")
+        query = str(name).strip()
+        matches = match_names(query, names)
+        exact = bool(matches) and names[matches[0]].lower() == query.lower()
+        if exact or (len(matches) == 1 and not query.isdigit()):
+            return matches[0]  # with duplicate names, the first
+        if not query.isdigit():
+            raise no_match("channel", name, names, matches)
     index = int(name)
     if not 0 <= index < len(names):
         raise ValueError(f"Channel index {index} doesn't exist (0-{len(names) - 1})")
@@ -74,9 +92,19 @@ def channel_data(c, fields, step_count):
         data["steps_on"] = [s for s in range(step_count) if channels.getGridBit(c, s, True)]
     return data
 
+STEPS_PER_BEAT = 4  # FL's default 16th-note steps
+
+def pattern_steps(p):
+    """Pattern length in 16th-note steps. getPatternLength counts steps, not beats as
+    documented: a pattern it reports as 32 loops after 8 beats (measured live)."""
+    return int(patterns.getPatternLength(p))
+
+def pattern_beats(p):
+    return pattern_steps(p) / STEPS_PER_BEAT
+
 def read_pattern(p, channel_indexes, fields):
     """Read one pattern. Steps need it to be the active pattern, so jump to it and back."""
-    step_count = int(patterns.getPatternLength(p) * 4)  # 4 sixteenth-note steps per beat
+    step_count = pattern_steps(p)
     original = patterns.patternNumber()
     if "steps" in fields and p != original:
         patterns.jumpToPattern(p)
@@ -88,10 +116,10 @@ def read_pattern(p, channel_indexes, fields):
     if set(fields) == {"steps"} and len(chans) > 1:
         chans = [ch for ch in chans if ch["steps_on"]]  # only steps asked for: skip channels without any
     return {"pattern": p, "name": patterns.getPatternName(p),
-            "length_beats": patterns.getPatternLength(p), "channels": chans}
+            "length_beats": pattern_beats(p), "channels": chans}
 
 def req_get_pattern_names():
-    return [{"pattern": p, "name": patterns.getPatternName(p), "length_beats": patterns.getPatternLength(p)}
+    return [{"pattern": p, "name": patterns.getPatternName(p), "length_beats": pattern_beats(p)}
             for p in used_patterns()]
 
 def req_get_channel_names():
@@ -142,7 +170,7 @@ def req_prepare_piano_roll(channel, pattern=None):
     if p != patterns.patternNumber():
         patterns.jumpToPattern(p)
     channels.selectOneChannel(c, True)
-    step_count = int(patterns.getPatternLength(p) * 4)
+    step_count = pattern_steps(p)
     return {"pattern": p, "pattern_name": patterns.getPatternName(p), "channel": c,
             "channel_name": channels.getChannelName(c, True),
             "steps_on": [s for s in range(step_count) if channels.getGridBit(c, s, True)],
@@ -190,17 +218,18 @@ def last_mixer_track():
     return mixer.getTrackInfo(getattr(midi, "TN_LastIns", 2))
 
 def find_mixer_track(track):
-    """Mixer track index from a number (0 = Master) or a name (case-insensitive)"""
+    """Mixer track index from a number (0 = Master) or a name or its start (case-insensitive)"""
     last = last_mixer_track()
     if isinstance(track, int) or str(track).strip().isdigit():
         number = int(track)
         if not 0 <= number <= last:
             raise ValueError(f"Mixer track {number} doesn't exist (0-{last})")
         return number
-    for t in range(last + 1):
-        if mixer.getTrackName(t).lower() == str(track).lower():
-            return t
-    raise ValueError(f"No mixer track named {track!r}")
+    names = [mixer.getTrackName(t) for t in range(last + 1)]
+    matches = match_names(track, names)
+    if len(matches) == 1 or (matches and names[matches[0]].lower() == str(track).strip().lower()):
+        return matches[0]
+    raise no_match("mixer track", track, names, matches)
 
 def req_get_mixer_track(track):
     t = find_mixer_track(track)
@@ -240,7 +269,66 @@ def req_undo_move(delta):
     general.undoUpDown(delta)
     return True
 
+SONGLENGTH_ABSTICKS = getattr(midi, "SONGLENGTH_ABSTICKS", 2)  # setSongPos/getSongLength unit: ticks
+
+def transport_state():
+    """What the server checks after a transport change (FL may apply it only after the request returns)"""
+    return {"playing": bool(transport.isPlaying()), "recording": bool(transport.isRecording()),
+            "mode": "song" if transport.getLoopMode() else "pattern",
+            "beat": round(transport.getSongPos(SONGLENGTH_ABSTICKS) / general.getRecPPQ(), 3)}
+
+def req_transport_state():
+    return transport_state()
+
+def req_play(mode=None, beat=None):
+    """
+    Start or resume playback. start() toggles play/pause, so it's only called when
+    not already playing. mode ("pattern"/"song") flips FL's PAT/SONG switch first;
+    beat jumps there (beats from the pattern or song start), also while playing.
+    Refuses while the record button is on, since playing would then record.
+    """
+    if transport.isRecording():
+        raise ValueError("FL Studio's record button is on, so playing would record. "
+                         "Turn it off with record(False) first.")
+    song = transport.getLoopMode() == 1
+    if mode is not None and song != (mode == "song"):
+        transport.setLoopMode()
+        song = not song
+    if beat is not None:
+        ppq = general.getRecPPQ()
+        length = (transport.getSongLength(SONGLENGTH_ABSTICKS) / ppq if song
+                  else pattern_beats(patterns.patternNumber()))
+        if beat < 0 or (beat > 0 and beat >= length):
+            raise ValueError(f"beat must be 0 to under {length:g} (the {'song' if song else 'pattern'} length)")
+        transport.setSongPos(int(round(beat * ppq)), SONGLENGTH_ABSTICKS)
+    if not transport.isPlaying():
+        transport.start()
+    return transport_state()
+
+def req_pause():
+    """Pause playback, keeping the position (start() toggles play/pause)"""
+    was_playing = bool(transport.isPlaying())
+    if was_playing:
+        transport.start()
+    return dict(transport_state(), was_playing=was_playing)
+
+def req_stop():
+    """Stop playback (FL goes back to the start)"""
+    transport.stop()
+    return transport_state()
+
+def req_record(on):
+    """Turn FL's record button on or off (record() toggles it)"""
+    if bool(transport.isRecording()) != bool(on):
+        transport.record()
+    return transport_state()
+
 REQUEST_HANDLERS = {
+    "transport_state": req_transport_state,
+    "play": req_play,
+    "pause": req_pause,
+    "stop": req_stop,
+    "record": req_record,
     "undo_state": req_undo_state,
     "undo_move": req_undo_move,
     "ping": lambda: "pong",

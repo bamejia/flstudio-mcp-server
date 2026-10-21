@@ -33,14 +33,9 @@ def register_tools():
 @mcp.tool()
 async def reload_server(ctx: Context) -> str:
     """
-    Reload the flstudio MCP server's code from disk (fl_bridge.py and fl_tools.py)
-    and the FL Studio script's request handlers (mcp_handlers.py)
-
-    Call this after editing either side so the changes take effect without
-    restarting the Claude app or reopening FL Studio's MIDI Settings. Open MIDI
-    ports and the FL Studio script log are kept. If a server file has a syntax
-    error, nothing is reloaded. Changes to trigger.py, or to the main FL script
-    (device_test.py), still need a restart / manual reload.
+    Reload fl_bridge.py, fl_tools.py and FL's mcp_handlers.py after editing them (no restart).
+    Ports and the FL log are kept; a syntax error reloads nothing. New tools, changed
+    parameters, trigger.py and device_test.py still need an app restart / reload in FL.
     """
     for module in (fl_bridge, fl_tools):
         try:
