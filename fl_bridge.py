@@ -213,25 +213,32 @@ kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD,
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 kernel32.GetCurrentThreadId.restype = wintypes.DWORD
 
+def window_process(hwnd):
+    """(process id, program path) of the process that owns a window; path is '' if unknown"""
+    pid = wintypes.DWORD()
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+    if not process:
+        return pid.value, ""
+    path = ctypes.create_unicode_buffer(1024)
+    size = wintypes.DWORD(1024)
+    found = kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size))
+    kernel32.CloseHandle(process)
+    return pid.value, path.value if found else ""
+
+def is_fl_process(path):
+    return path.lower().endswith("\\" + FL_PROCESS_NAME)
+
 def fl_windows():
     """(handle, title) of FL Studio's visible top-level windows"""
     windows = []
 
     @WNDENUMPROC
     def check(hwnd, _):
-        if user32.IsWindowVisible(hwnd):
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
-            if process:
-                path = ctypes.create_unicode_buffer(1024)
-                size = wintypes.DWORD(1024)
-                if kernel32.QueryFullProcessImageNameW(process, 0, path, ctypes.byref(size)) \
-                        and path.value.lower().endswith("\\" + FL_PROCESS_NAME):
-                    title = ctypes.create_unicode_buffer(512)
-                    user32.GetWindowTextW(hwnd, title, 512)
-                    windows.append((hwnd, title.value))
-                kernel32.CloseHandle(process)
+        if user32.IsWindowVisible(hwnd) and is_fl_process(window_process(hwnd)[1]):
+            title = ctypes.create_unicode_buffer(512)
+            user32.GetWindowTextW(hwnd, title, 512)
+            windows.append((hwnd, title.value))
         return True
 
     user32.EnumWindows(check, 0)

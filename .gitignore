@@ -11,3 +11,4 @@ wheels/
 
 # IDE settings
 .idea/
+logs/

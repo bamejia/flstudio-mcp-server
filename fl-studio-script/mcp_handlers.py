@@ -6,9 +6,14 @@
 # Each REQUEST_HANDLERS entry takes the request's args as keyword arguments and
 # returns JSON-serializable data.
 
+import builtins
+import importlib
 import math
+import os
+import sys
 
 import channels
+import device
 import general
 import midi
 import mixer
@@ -16,6 +21,40 @@ import patterns
 import plugins
 import transport
 import ui
+
+# device_test.py.py runs as __main__; its print() also forwards each line to the
+# MCP server (get_fl_log), so prints here and in keybinds.py use it too
+print = getattr(sys.modules.get("__main__"), "print", builtins.print)
+
+class ForwardedStderr:
+    """sys.stderr that also sends each line to the MCP server's log, so the tracebacks
+    FL prints for this script's errors reach get_fl_log too"""
+
+    def __init__(self, stream):
+        self.wrapped_stream = stream
+        self.pending = ""
+
+    def write(self, text):
+        if self.wrapped_stream is not None:
+            self.wrapped_stream.write(text)
+        self.pending += text
+        *lines, self.pending = self.pending.split("\n")
+        for line in lines:
+            if line.strip():
+                try:
+                    if device.isAssigned():
+                        sys.modules["__main__"].send_sysex(SYSEX_LOG, line)
+                except Exception:
+                    pass  # never raise from stderr
+        return len(text)
+
+    def flush(self):
+        if self.wrapped_stream is not None:
+            self.wrapped_stream.flush()
+
+SYSEX_LOG = 0x01  # as in device_test.py.py
+# Replace any wrapper from before a reload, so its code is current
+sys.stderr = ForwardedStderr(getattr(sys.stderr, "wrapped_stream", sys.stderr))
 
 # Channel type constants (midi.CT_Sampler, CT_GenPlug, ...) -> readable names
 CHANNEL_TYPES = {getattr(midi, n): n[3:] for n in dir(midi) if n.startswith("CT_")}
@@ -323,7 +362,79 @@ def req_record(on):
         transport.record()
     return transport_state()
 
+# --- Keybinds ------------------------------------------------------------------
+# keybinds.py (next to this file) maps key combos to actions. The keyboard
+# listener (trigger\keyboard_listener.py in the repo) asks for the combos with
+# "keybinds", catches them while FL Studio is focused and runs them with
+# "run_keybind". Combos FL Studio already uses are switched off and reported in
+# FL's Script output (and get_fl_log), so those keys keep working in FL.
+
+def load_module(name):
+    """Import, or re-import from disk, a module next to this file; its print() is forwarded"""
+    module = importlib.reload(sys.modules[name]) if name in sys.modules else importlib.import_module(name)
+    module.print = print
+    return module
+
+def keybind_call(action):
+    """The function that runs a keybinds.py action; ValueError if it isn't valid"""
+    if callable(action):
+        return action
+    name, args = (action, {}) if isinstance(action, str) else (tuple(action) + ({},))[:2]
+    if name not in REQUEST_HANDLERS or not isinstance(args, dict):
+        raise ValueError(f"unknown action {action!r}. Use a request name, (name, {{args}}) or "
+                         f"a function. Requests: play, pause, stop, record")
+    return lambda: REQUEST_HANDLERS[name](**args)
+
+def read_keybinds(keybinds):
+    """canonical combo -> (modifier bits, key code, function), and messages about skipped combos"""
+    import fl_shortcuts
+    binds, notes = {}, []
+    for combo, action in getattr(keybinds, "KEYBINDS", {}).items():
+        try:
+            name, mods, key = fl_shortcuts.parse_combo(combo)
+            call = keybind_call(action)
+        except (ValueError, TypeError) as e:
+            notes.append(f"{combo!r} skipped: {e}")
+            continue
+        used = fl_shortcuts.in_use(name)
+        if used:
+            notes.append(f"{name} is off, FL Studio uses it ({used}). Pick another combo.")
+        elif name in binds:
+            notes.append(f"{name} is listed twice; the first one is used.")
+        else:
+            binds[name] = (mods, key, call)
+    return binds, notes
+
+def req_keybinds():
+    """Load keybinds.py from disk; returns its path and the active combos as [combo, modifier bits, key code]"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "keybinds.py")
+    load_module("fl_shortcuts")
+    try:
+        keybinds = load_module("keybinds")
+    except Exception as e:
+        print(f"keybinds: keybinds.py not loaded ({type(e).__name__}: {e}). Fix it and save again.")
+        raise
+    binds, notes = read_keybinds(keybinds)
+    for note in notes:
+        print(f"keybinds: {note}")
+    print(f"keybinds: {len(binds)} on" + (f", {len(notes)} skipped (see above)" if notes else ""))
+    return {"file": path, "binds": [[name, mods, key] for name, (mods, key, _) in binds.items()]}
+
+def req_run_keybind(combo):
+    """Run the keybinds.py action for a combo the listener caught"""
+    keybinds = sys.modules.get("keybinds") or load_module("keybinds")
+    bind = read_keybinds(keybinds)[0].get(combo)
+    if bind is None:
+        raise KeyError(f"{combo} isn't an active combo in keybinds.py")
+    try:
+        bind[2]()
+    except Exception as e:
+        print(f"keybinds: {combo} failed: {type(e).__name__}: {e}")
+        raise
+
 REQUEST_HANDLERS = {
+    "keybinds": req_keybinds,
+    "run_keybind": req_run_keybind,
     "transport_state": req_transport_state,
     "play": req_play,
     "pause": req_pause,
