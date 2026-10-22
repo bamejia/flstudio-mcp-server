@@ -280,9 +280,22 @@ def req_select(channel=None, mixer_track=None, focus=None):
         ui.setFocused(WINDOWS[focus])
     if channel is not None:
         channels.selectOneChannel(find_channel(channel), True)
+        if focus == "channel_rack":
+            ui.scrollWindow(midi.widChannelRack, find_channel(channel))
     if mixer_track is not None:
         mixer.setTrackNumber(find_mixer_track(mixer_track), getattr(midi, "curfxScrollToMakeVisible", 1))
     return previous
+
+def req_instrument_link(channel):
+    """A channel's instrument-track clues: FL names a playlist track and the channel's mixer
+    track after the channel when it links them, and gives both their default names back when
+    it unlinks them (no API tells)"""
+    c = find_channel(channel)
+    name = channels.getChannelName(c, True)
+    track = channels.getTargetFxTrack(c, True)
+    return {"index": c, "name": name, "mixer_track": track, "mixer_name": mixer.getTrackName(track),
+            "playlist_tracks": [t for t in range(1, playlist.trackCount() + 1) if playlist.getTrackName(t) == name],
+            "same_name": sum(channels.getChannelName(i, True) == name for i in range(channels.channelCount(True)))}
 
 def req_active_effect(focus=False):
     """The mixer effect whose window has focus ([track, slot], its name) or None, and the
@@ -894,6 +907,7 @@ REQUEST_HANDLERS = {
     "ping": lambda: "pong",
     "get_mixer_track": req_get_mixer_track,
     "select": req_select,
+    "instrument_link": req_instrument_link,
     "browser": req_browser,
     "active_effect": req_active_effect,
     "get_channel": req_get_channel,

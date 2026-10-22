@@ -17,9 +17,9 @@ from mido import Message
 from fl_bridge import (CC_TEMPO_LSB, CC_TEMPO_MSB, CC_TEMPO_REPLY_LSB, CC_TEMPO_REPLY_MSB,
                        CC_TEMPO_REQUEST, FL_USER_DATA_DIR, INPUT_PORT_NAME, VK_CONTROL, VK_DOWN, VK_END,
                        VK_ESCAPE, VK_HOME, VK_L, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP, FLStudioError,
-                       ensure_listener, fl_in_front, fl_install_dir, child_windows, click, cursor_kept, fl_log,
-                       fl_main_window, fl_request, focus_kept, foreground_class, hover, fl_top_window,
-                       fl_top_windows, open_in_fl, press_keys, require, run_export_notes, save_permissions,
+                       ensure_listener, fl_in_front, fl_install_dir, child_windows, class_name, click, cursor_kept,
+                       fl_log, fl_main_window, fl_request, focus_kept, foreground_class, hover, fl_top_window,
+                       fl_top_windows, fl_windows, open_in_fl, press_keys, require, run_export_notes, save_permissions,
                        screen_colors, send, tempo_replies, type_text, uncovered, window_dpi, window_rect,
                        window_title)
 
@@ -1698,11 +1698,13 @@ def assign_free_mixer_track(channel, warnings):
         raise FLStudioError(f"Ctrl+L didn't change the channel's mixer track (still {track}).")
     return track
 
-def add_instrument(plugin: str, link: bool = False):
+def add_instrument(plugin: str, link: bool = False, track: bool = False):
     """
     Add a channel with an instrument from FL's plugin database, as FL's browser does.
     plugin: name or its start, e.g. "vital". link: also route it to a free mixer track (FL's Ctrl+L).
-    Returns the new channel's name, or {channel, mixer_track} with link. FL may open the plugin's window.
+    track: also make it an instrument track (as instrument_track; mouse).
+    Returns the new channel's name, or {channel, mixer_track} with link, plus playlist_track with
+    track. FL may open the plugin's window.
     """
     _, preset = find_preset(plugin, "Generators")
     before = [c["name"] for c in fl_request("get_channel_names")]
@@ -1714,6 +1716,10 @@ def add_instrument(plugin: str, link: bool = False):
     if len(after) <= len(before):
         raise FLStudioError(f"FL Studio didn't add a {preset.stem} channel within 20s.")
     index = next((i for i, (a, b) in enumerate(zip(after, before)) if a != b), len(before))
+    if track:
+        linked = instrument_track(str(index))
+        result = {"channel": after[index], **linked.get("result", linked)[after[index]]}
+        return with_warnings(result, warnings + linked.get("warnings", []))
     if not link:
         return with_warnings(after[index], warnings)
     track = assign_free_mixer_track(str(index), warnings)
@@ -1757,6 +1763,135 @@ def add_effect(plugin: str, track: str):
     if not new:
         raise FLStudioError(f"FL Studio didn't add {parts[-1][:-4]} within 15s.")
     return with_warnings(new[0], warnings)
+
+# No API makes instrument tracks. A channel button's menu (right-click) ends its left column
+# with "Assign to new instrument track", or "Unassign from instrument track" once linked; its
+# right column starts with Cut, so Home, Right, Up reaches it whatever the channel type.
+# FL's hint over a channel button is the channel's name. Linking names the first free
+# playlist track and a free mixer track after the channel; unlinking gives both their
+# default names back (routing stays). Each is one undo entry.
+INSTRUMENT_ACTIONS = {"": "assign", "a": "assign", "assign": "assign", "s": "separate", "sep": "separate",
+                      "separate": "separate", "u": "separate", "unassign": "separate"}
+CHANNEL_BUTTON_X = 210  # the middle of the channel buttons, right of the rows' left edge (100%)
+
+def channel_rack_rows():
+    """(the channel rack window, its rows' rect), showing it first (it may be detached or docked)"""
+    def find():
+        racks = [hwnd for hwnd, _ in fl_windows() if class_name(hwnd) == "TStepSeqForm"]
+        racks += [hwnd for hwnd, cls, _, _, visible in child_windows(fl_main_window()[0])
+                  if cls == "TStepSeqForm" and visible]
+        return racks[0] if racks else None
+    rack = wait_for(find, bool, 1.5)
+    if not rack:
+        raise FLStudioError("FL Studio's channel rack didn't show.")
+    panels = [rect for _, cls, _, rect, visible in child_windows(rack)
+              if cls == "TVectorPanel" and visible and rect[2] - rect[0] > 100]
+    if not panels:
+        raise FLStudioError("Couldn't find the channel rack's rows (FL Studio's layout differs from what's expected).")
+    return rack, max(panels, key=lambda rect: rect[3] - rect[1])
+
+def channel_button(name, hint, rows, scale):
+    """(x, y) on the channel button FL's hint names: scan down the button column, then the
+    middle between the row's edges"""
+    left, top, _, bottom = rows
+    x = left + CHANNEL_BUTTON_X * scale
+    y = top + 2
+    while y < bottom and hint(x, y) != name:
+        y += 8
+    if y >= bottom:
+        raise FLStudioError(f"Couldn't find {name!r}'s button in the channel rack (a filter group may hide it).")
+
+    def edge(inside, outside):
+        while abs(inside - outside) > 1:
+            middle = (inside + outside) // 2
+            inside, outside = (middle, outside) if hint(x, middle) == name else (inside, middle)
+        return inside
+    below = y
+    while below + 8 < bottom and hint(x, below + 8) == name:
+        below += 8
+    return x, (edge(y, max(top, y - 8)) + edge(below, min(bottom, below + 8))) // 2
+
+def instrument_track(channel: str | list[str], action: str = ""):
+    """
+    FL's "Assign to new instrument track" from the channel's menu (mouse: only while the user
+    allows it): links each channel to the first free playlist track and a free mixer track,
+    both named after it (names and colors then follow the channel).
+    channel: name, its start or index, or a list. action: assign (a, default) or separate (s):
+    "Unassign from instrument track", the tracks get their default names back, routing stays.
+    Returns {channel: {playlist_track, mixer_track}}. FL comes to the front; one undo step each.
+    """
+    try:
+        action = INSTRUMENT_ACTIONS[action.strip().lower()]
+    except KeyError:
+        raise ValueError("action: assign(a) separate(s)") from None
+    names = [channel] if isinstance(channel, str) else list(channel)
+    warnings, done, result = [], 0, {}
+    with fl_in_front(warnings), cursor_kept():
+        previous = None
+        try:
+            for name in names:
+                before = fl_request("instrument_link", channel=name)
+                linked = (before["mixer_track"] > 0 and before["mixer_name"] == before["name"]
+                          and before["playlist_tracks"])
+                if action == "assign" and linked:
+                    result[before["name"]] = {"playlist_track": before["playlist_tracks"][0],
+                                              "mixer_track": before["mixer_track"], "note": "already linked"}
+                    continue
+                if action == "separate" and not linked:
+                    raise ValueError(f"{before['name']} isn't an instrument track (no playlist track and mixer "
+                                     "track named after it).")
+                if before["same_name"] > 1:
+                    raise ValueError(f"Several channels are named {before['name']!r} (FL's hint shows only names): "
+                                     "rename one first.")
+                selected = fl_request("select", channel=before["index"], focus="channel_rack")
+                previous = selected if previous is None else previous
+                time.sleep(0.2)
+                rack, rows = channel_rack_rows()
+                scale = window_dpi(rack) / 96
+                with uncovered(rack) as clear:
+                    def hint(x, y):
+                        clear(x, y)
+                        hover(x, y)
+                        return fl_request("hint")["hint"]
+                    x, y = channel_button(before["name"], hint, rows, scale)
+                    click(x, y, "right")
+                    menu = wait_for(popups, bool, 1.5)
+                    if len(menu) != 1:
+                        raise FLStudioError(f"{before['name']}'s channel menu didn't open.")
+                    for vk in (VK_HOME, VK_RIGHT, VK_UP):
+                        press_keys(vk)
+                        time.sleep(0.05)
+                    # The lit row must be the left column's last (Delete... sits above it)
+                    left, top, _, bottom = window_rect(menu[0])
+                    lit, plain = screen_colors(left + 8 * scale, (bottom - 12 * scale, top + 34 * scale))
+                    if close_color(lit, plain):
+                        raise FLStudioError(f"Couldn't reach the instrument track item in {before['name']}'s "
+                                            "channel menu; nothing changed.")
+                    press_keys(VK_RETURN)
+                    wait_for(popups, lambda p: not p, 1.5)
+                after = wait_for(lambda: fl_request("instrument_link", channel=before["index"]),
+                                 lambda a: a["playlist_tracks"] != before["playlist_tracks"], 2.0)
+                added = [t for t in after["playlist_tracks"] if t not in before["playlist_tracks"]]
+                removed = [t for t in before["playlist_tracks"] if t not in after["playlist_tracks"]]
+                if (added if action == "assign" else removed):
+                    done += 1
+                    track = (added or removed)[0]
+                    result[after["name"]] = {"playlist_track": track, "mixer_track": after["mixer_track"]}
+                    continue
+                if added or removed:  # the item did the opposite
+                    move_history(1, undo=True)
+                raise FLStudioError(f"FL didn't {'link' if action == 'assign' else 'unlink'} {before['name']} "
+                                    f"({'undone' if added or removed else 'nothing changed'}).")
+        except Exception as e:
+            close_boxes()
+            if done:
+                move_history(done, undo=True)
+                raise FLStudioError(f"{e} Undid the {done} channel(s) changed before it.") from e
+            raise
+        finally:
+            if previous is not None and previous["channel"] >= 0:
+                fl_request("select", channel=previous["channel"])
+    return with_warnings(result, warnings)
 
 def send_melody(notes_data):
     """(Legacy; prefer add_notes.) Records notes over MIDI: notes_data lines "note,velocity,length,position" (beats; 0.1 resolution; max 127)."""
@@ -1855,7 +1990,7 @@ TOOLS = [
     get_pattern_names, get_channel_names, get_channel, get_pattern, get_all_patterns, get_notes, add_notes, remove_notes, undo, redo,
     set_permissions, get_mixer_track, get_plugin_params, set_plugin_param, change_preset, set_channel, set_mixer_track,
     set_pattern, set_playlist_track, place_pattern, delete_clip, arrangement, record_automation, automation_clip,
-    add_instrument, add_effect, send_melody, send_midi_note,
+    instrument_track, add_instrument, add_effect, send_melody, send_midi_note,
 ]
 
 # A tool's description is its docstring, sent whenever the tools load: drop the indentation
