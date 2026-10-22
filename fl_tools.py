@@ -19,7 +19,8 @@ from fl_bridge import (CC_TEMPO_LSB, CC_TEMPO_MSB, CC_TEMPO_REPLY_LSB, CC_TEMPO_
                        VK_ESCAPE, VK_HOME, VK_L, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP, FLStudioError,
                        ensure_listener, fl_in_front, fl_install_dir, child_windows, class_name, click, cursor_kept,
                        fl_log, fl_main_window, fl_request, focus_kept, foreground_class, hover, fl_top_window,
-                       fl_top_windows, fl_windows, open_in_fl, press_keys, require, run_export_notes, save_permissions,
+                       fl_top_windows, fl_windows, open_in_fl, permissions, press_keys, require, run_export_notes,
+                       save_permissions,
                        screen_colors, send, tempo_replies, type_text, uncovered, window_dpi, window_rect,
                        window_title)
 
@@ -1179,15 +1180,123 @@ def arrangement(action: str = "", name: str = ""):
         menu.warnings.append(f"FL shows the name as {state['current']!r}")
     return with_warnings(state, menu.warnings)
 
+# FL's record filter (the record button's right-click menu) decides what recording stores; no
+# API reads or sets it. The button's hint names what's ticked: "Record  (automation, score)".
+# The menu lists the filter first (Automation, Notes = "score", Audio, Clips): Home then Down
+# reaches each, Enter toggles it and the menu stays open. One toggle per opening: keys sent
+# right after a toggle were lost or closed the menu. Items are ticked before others are
+# unticked, so the filter is never empty (FL seemed to refuse that).
+RECORD_FILTER = ("automation", "score", "audio", "clips")
+RECORD_HINT = re.compile(r"Record\s*(?:\((.*)\))?")
+RECORD_MENU_SIZE = (318, 157)  # the record button's menu at 100% scaling
+record_button_at = None  # where the button was last found
+
+class RecordFilter:
+    """FL in front; the mouse and any menu left open are put back on exit"""
+
+    def __enter__(self):
+        self.warnings = []
+        self.exits = contextlib.ExitStack()
+        try:
+            self.exits.enter_context(fl_in_front(self.warnings))
+            self.exits.enter_context(cursor_kept())
+            self.exits.callback(close_boxes)
+            self.button = self.find_button()
+        except BaseException:
+            self.exits.close()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.exits.close()
+
+    def items_at(self, x, y):
+        """The ticked filter items if FL's hint at (x, y) is the record button's, else None"""
+        hover(x, y)
+        text = fl_request("hint")["hint"].strip()
+        for _ in range(4):  # the hint can lag a mouse move
+            again = fl_request("hint")["hint"].strip()
+            if again == text:
+                break
+            text = again
+        match = RECORD_HINT.fullmatch(text)
+        return None if match is None else {item.strip() for item in (match[1] or "").split(",") if item.strip()}
+
+    def find_button(self):
+        """(x, y) of the record button, found by FL's hint along the toolbars"""
+        global record_button_at
+        main = fl_main_window()[0]
+        bars = [rect for _, cls, _, rect, visible in child_windows(main) if cls == "TQuickEditToolBar" and visible]
+        if not bars:
+            raise FLStudioError("Couldn't find FL Studio's toolbar.")
+        self.away = (bars[0][0] + 4, (bars[0][1] + bars[0][3]) // 2)
+        hover(*self.away)  # elsewhere first: the hint may still show a message
+        if record_button_at is not None and self.items_at(*record_button_at) is not None:
+            return record_button_at
+        scale = window_dpi(main) / 96
+        for left, top, right, bottom in bars:
+            y = (top + bottom) // 2
+            for x in range(left + 4, right, round(16 * scale)):  # the button is ~29 px wide at 100%
+                if self.items_at(x, y) is not None:
+                    end = x
+                    while end + 4 * scale < right and self.items_at(end + 4 * scale, y) is not None:
+                        end += 4 * scale
+                    record_button_at = (round((x + end) / 2), y)
+                    return record_button_at
+        raise FLStudioError("Couldn't find FL's record button in its toolbars.")
+
+    def ticked(self):
+        """The ticked filter items, from the record button's hint"""
+        hover(*self.away)
+        items = self.items_at(*self.button)
+        if items is None:
+            raise FLStudioError("FL's record button moved.")
+        if items - set(RECORD_FILTER):
+            raise FLStudioError(f"FL's record button names unknown filter items: {sorted(items)}")
+        return items
+
+    def toggle(self, item, before):
+        """Toggle one filter item in the record button's menu; returns the ticked items, checked
+        to differ from before by that item alone"""
+        click(*self.button, button="right")
+        menu = wait_for(popups, bool, 1.5)
+        if len(menu) != 1:
+            raise FLStudioError("The record button's menu didn't open.")
+        left, top, right, bottom = window_rect(menu[0])
+        scale = window_dpi(menu[0]) / 96
+        size = ((right - left) / scale, (bottom - top) / scale)
+        if any(abs(a - b) > 40 for a, b in zip(size, RECORD_MENU_SIZE)):
+            raise FLStudioError(f"The menu that opened isn't the record button's as expected "
+                                f"({size[0]:.0f}x{size[1]:.0f}); nothing pressed.")
+        time.sleep(0.2)
+        for vk in (VK_HOME,) + (VK_DOWN,) * RECORD_FILTER.index(item) + (VK_RETURN,):
+            press_keys(vk)
+            time.sleep(0.15)
+        time.sleep(0.2)
+        close_boxes()
+        after = self.ticked()
+        if after != before ^ {item}:
+            raise FLStudioError(f"Toggling {item!r} changed FL's record filter from {sorted(before)} to {sorted(after)}.")
+        return after
+
+    def set(self, wanted):
+        """Tick exactly the wanted items; returns the ones ticked before"""
+        before = current = self.ticked()
+        order = sorted(wanted - current, key=RECORD_FILTER.index) + sorted(current - wanted, key=RECORD_FILTER.index)
+        for item in order:
+            current = self.toggle(item, current)
+        return before
+
 def record_automation(param: str, points: list[list], channel: str = "", track: str = "", slot: int | None = None):
     """
     Record automation by playing FL with recording on and moving the control in real time
     (accurate to a few ms; plays sound). It lands where FL records automation: the active
-    pattern's events (pattern mode) or FL's record settings' choice.
+    pattern's events (pattern mode; song mode: the pattern playing there).
     What: param of a channel's plugin or a mixer track's effect (slot 0-9; "mix" = its mix
     level), or a mixer track's (no slot) "volume", "pan" or "sep".
     points: [[beat, value], ...], linear between; value 0-1, or display text for plugin params.
-    Needs "Automation" ticked in FL's record filter (right-click the record button).
+    FL's record filter is set to Automation only meanwhile and put back after (mouse; with
+    mouse use off it stays as it is and must have Automation ticked).
     """
     if bool(channel) == bool(track):
         raise ValueError("Give either channel, or track (and slot)")
@@ -1200,6 +1309,34 @@ def record_automation(param: str, points: list[list], channel: str = "", track: 
         raise ValueError("Give at least one point")
     beats = max(p[0] for p in points) - min(p[0] for p in points)
     seconds = beats * 60 / max(get_tempo(), 10)
+    warnings, before, error = [], None, None
+    if permissions()["mouse"] and permissions()["focus"]:
+        with RecordFilter() as menu:
+            before = menu.set({"automation"})
+        warnings += menu.warnings
+    else:
+        warnings.append("FL's record filter wasn't checked (mouse use or focus is off): nothing is stored "
+                        "unless Automation is ticked, and other ticked items record too.")
+    try:
+        result = record_ramp(param, points, args, seconds)
+    except Exception as e:
+        error = e
+    if before not in (None, {"automation"}):
+        try:
+            with RecordFilter() as menu:
+                menu.set(before)
+            warnings += menu.warnings
+        except FLStudioError as e:
+            note = f"Couldn't put FL's record filter back to {sorted(before)}: {e}"
+            if error is not None:
+                raise FLStudioError(f"{error} {note}") from error
+            warnings.append(note)
+    if error is not None:
+        raise error
+    return with_warnings(result, warnings)
+
+def record_ramp(param, points, args, seconds):
+    """Play FL recording and send the ramp's values until its last point"""
     start = fl_request("automation_start", param=param, points=points, **args)
     deadline = time.time() + seconds + 10
     sent, done = 0, False

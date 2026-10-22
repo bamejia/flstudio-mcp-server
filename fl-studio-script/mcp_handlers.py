@@ -571,6 +571,8 @@ def req_set_playlist_track(track, name=None, color=None, muted=None, solo=None):
 # data (or wherever FL's record settings put it). automation_start starts FL playing
 # and recording; the server then calls automation_tick as fast as it can, which sends
 # the ramp's value at FL's current song position, and stops FL after the last point.
+# Without REC_Init: with it FL also set the control's "Init song with this position" value
+# (Tools > Last tweaked), which undoing the recording doesn't remove.
 MIXER_EVENTS = {"volume": midi.REC_Mixer_Vol, "pan": midi.REC_Mixer_Pan, "sep": midi.REC_Mixer_SS}
 automation = {}
 
@@ -614,6 +616,10 @@ def req_automation_start(param, points, channel=None, track=None, slot=None):
     if not song and ticks[-1][0] > pattern_beats(patterns.patternNumber()) * ppq:
         raise ValueError(f"The last point is past the end of the pattern ({pattern_beats(patterns.patternNumber()):g} beats), "
                          "where FL would loop: use a longer pattern or song mode")
+    song_ticks = transport.getSongLength(SONGLENGTH_ABSTICKS)
+    if song and ticks[-1][0] > song_ticks:
+        raise ValueError(f"The last point is past the end of the song ({song_ticks / ppq:g} beats; "
+                         "an empty playlist doesn't play): place clips first or use pattern mode")
     send_value(event, ticks[0][1], midi.REC_UpdateValue | midi.REC_UpdateControl)
     automation.clear()
     automation.update(event=event, points=ticks, last=ticks[0][0])
@@ -632,7 +638,8 @@ def req_automation_tick():
     # Done after the last point, when FL stopped, or when the position wrapped (pattern loop)
     done = tick >= points[-1][0] or tick < automation["last"] or not transport.isPlaying()
     if tick >= points[0][0] or done:
-        send_value(automation["event"], ramp_value(points, points[-1][0] if done else tick), midi.REC_MIDIController)
+        send_value(automation["event"], ramp_value(points, points[-1][0] if done else tick),
+                   midi.REC_MIDIController & ~midi.REC_Init)
     automation["last"] = tick
     if done:
         transport.stop()
