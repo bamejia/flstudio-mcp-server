@@ -12,3 +12,6 @@ wheels/
 # IDE settings
 .idea/
 logs/
+
+# Local state: what the user allows (set_permissions)
+permissions.json

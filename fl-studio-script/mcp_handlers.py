@@ -18,6 +18,7 @@ import general
 import midi
 import mixer
 import patterns
+import playlist
 import plugins
 import transport
 import ui
@@ -178,22 +179,18 @@ def req_get_all_patterns(fields=("info", "mixer", "steps")):
     channel_indexes = list(range(channels.channelCount(True)))
     return [read_pattern(p, channel_indexes, set(fields)) for p in used_patterns()]
 
-def req_get_plugin_params(channel, name_filter="", limit=200):
-    c = find_channel(channel)
-    if not plugins.isValid(c, -1, True):
-        raise ValueError(f"Channel {channel!r} has no plugin (it may be an audio sample)")
-    count = plugins.getParamCount(c, -1, True)
+def req_get_plugin_params(channel=None, name_filter="", limit=200, track=None, slot=None):
+    plugin = plugin_target(channel, track, slot)
+    count = plugins.getParamCount(*plugin)
     params = []
     for i in range(min(count, 4096)):  # VST indexes 4096+ are MIDI CC/aftertouch mappings, not settings
-        name = plugins.getParamName(i, c, -1, True)
+        name = plugins.getParamName(i, *plugin)
         if not name or name_filter.lower() not in name.lower():
             continue
-        params.append({"index": i, "name": name,
-                       "value": finite(plugins.getParamValue(i, c, -1, True), 4),
-                       "display": plugins.getParamValueString(i, c, -1, True).strip() or None})
+        params.append(param_state(i, plugin))
         if len(params) >= limit:
             break
-    return {"channel": channels.getChannelName(c, True), "plugin": plugins.getPluginName(c, -1, False, True),
+    return {"plugin": plugins.getPluginName(plugin[0], plugin[1], False, plugin[2]),
             "param_count": count, "returned": len(params), "params": params}
 
 def req_prepare_piano_roll(channel, pattern=None):
@@ -253,8 +250,9 @@ def req_restore_selection(pattern, channel):
 MIXER_SLOTS = 10  # effect slots per mixer track
 
 def last_mixer_track():
-    """Index of the last insert track (trackCount() also counts a special 'current' track)"""
-    return mixer.getTrackInfo(getattr(midi, "TN_LastIns", 2))
+    """Index of the last insert track. TN_LastIns said 500 in a project with tracks 0-19
+    (trackCount() 20), and trackCount() may also count a special 'current' track."""
+    return min(mixer.getTrackInfo(getattr(midi, "TN_LastIns", 2)), mixer.trackCount() - 1)
 
 def find_mixer_track(track):
     """Mixer track index from a number (0 = Master) or a name or its start (case-insensitive)"""
@@ -270,12 +268,55 @@ def find_mixer_track(track):
         return matches[0]
     raise no_match("mixer track", track, names, matches)
 
+WINDOWS = {"mixer": midi.widMixer, "channel_rack": midi.widChannelRack,
+           "playlist": midi.widPlaylist, "piano_roll": midi.widPianoRoll, "browser": midi.widBrowser}
+
+def req_select(channel=None, mixer_track=None, focus=None):
+    """Select one channel and/or a mixer track, and show and focus a window (WINDOWS key);
+    returns the previous selection, to put back with another select"""
+    previous = {"channel": channels.selectedChannel(False, False, True), "mixer_track": mixer.trackNumber()}
+    if focus is not None:
+        ui.showWindow(WINDOWS[focus])
+        ui.setFocused(WINDOWS[focus])
+    if channel is not None:
+        channels.selectOneChannel(find_channel(channel), True)
+    if mixer_track is not None:
+        mixer.setTrackNumber(find_mixer_track(mixer_track), getattr(midi, "curfxScrollToMakeVisible", 1))
+    return previous
+
+def req_active_effect(focus=False):
+    """The mixer effect whose window has focus ([track, slot], its name) or None, and the
+    focused FL window's caption; focus brings that effect's window to the front (to close it
+    with Esc: browser loads replace the active effect)"""
+    active = mixer.getActiveEffectIndex()
+    if active is not None and focus:
+        mixer.focusEditor(*active)
+    return {"active": active, "name": plugins.getPluginName(*active, True) if active is not None else None,
+            "focused": ui.getFocusedFormCaption()}
+
+def req_browser(move=0, tab=None):
+    """Move the browser's selection move items down (negative: up), after switching tab
+    ("left"/"right") if given. Returns the tab's name (with tab) and [caption, file type]
+    after each step, or of the current item. Folders can only be opened with keys, and
+    ui.selectBrowserMenuItem opens a menu that blocks this script until it closes, so the
+    server presses Right / Enter instead."""
+    result = {}
+    if tab:
+        result["tab"] = ui.navigateBrowserTabs(midi.FPT_Left if tab == "left" else midi.FPT_Right)
+    items = []
+    for _ in range(abs(move)):
+        ui.navigateBrowser(midi.FPT_Down if move > 0 else midi.FPT_Up, False)
+        items.append([ui.getFocusedNodeCaption(), ui.getFocusedNodeFileType()])
+    result["items"] = items or [[ui.getFocusedNodeCaption(), ui.getFocusedNodeFileType()]]
+    result["focused"] = ui.getFocusedFormCaption()  # keys go to this window
+    return result
+
 def req_get_mixer_track(track):
     t = find_mixer_track(track)
     effects = []
     for s in range(MIXER_SLOTS):
         if plugins.isValid(t, s):
-            effect = {"slot": s, "plugin": plugins.getPluginName(t, s)}
+            effect = {"slot": s, "plugin": plugins.getPluginName(t, s), "on": bool(slot_switch(t, s))}
             if plugins.getPluginName(t, s, True) != effect["plugin"]:
                 effect["name"] = plugins.getPluginName(t, s, True)  # renamed by the user
             effects.append(effect)
@@ -296,6 +337,296 @@ def req_get_mixer_track(track):
         "channels": [channels.getChannelName(c, True) for c in range(channels.channelCount(True))
                      if channels.getTargetFxTrack(c, True) == t],
     }
+
+# --- Changing the project ------------------------------------------------------
+# Setters take only what to change (None leaves a value alone) and return the
+# object's values as FL now has them; the server keeps the ones that were set.
+# Colors are 0xRRGGBB (FL's utils.ColorToRGB); volumes are FL's 0-1 faders.
+
+def rgb(color):
+    return color & 0xFFFFFF  # FL may report an alpha byte too
+
+def set_db(set_volume, get_db, db):
+    """Set a fader to read db dB. FL's fader curve isn't documented, so bisect it."""
+    low, high = 0.0, 1.0
+    for _ in range(24):
+        middle = (low + high) / 2
+        set_volume(middle)
+        if get_db() < db:
+            low = middle
+        else:
+            high = middle
+    set_volume(high)
+
+def req_set_channel(channel, name=None, color=None, volume=None, db=None, pan=None, muted=None, solo=None,
+                    mixer_track=None):
+    c = find_channel(channel)
+    if name is not None:
+        channels.setChannelName(c, name, True)
+    if color is not None:
+        channels.setChannelColor(c, color, True)
+    if db is not None:
+        set_db(lambda v: channels.setChannelVolume(c, v, midi.PIM_None, True),
+               lambda: channels.getChannelVolume(c, 1, True), db)
+    elif volume is not None:
+        channels.setChannelVolume(c, volume, midi.PIM_None, True)
+    if pan is not None:
+        channels.setChannelPan(c, pan, midi.PIM_None, True)
+    if muted is not None:
+        channels.muteChannel(c, int(muted), True)
+    if solo is not None:
+        channels.soloChannel(c, int(solo), True)
+    if mixer_track is not None:
+        channels.setTargetFxTrack(c, find_mixer_track(mixer_track), True)
+    return dict(channel_data(c, ("info", "mixer"), 0), color=rgb(channels.getChannelColor(c, True)))
+
+def effect_slot(t, slot):
+    slot = int(slot)
+    if not (0 <= slot < MIXER_SLOTS and plugins.isValid(t, slot)):
+        raise ValueError(f"Mixer track {t} has no effect in slot {slot}")
+    return slot
+
+def slot_switch(t, slot, value=None):
+    """A mixer effect slot's on switch (REC_Plug_Mute event, despite the name 1 = on); value
+    sets it. Returns the switch's value."""
+    event = mixer.getTrackPluginId(t, slot) + midi.REC_Plug_Mute
+    if value is not None:
+        general.processRECEvent(event, value, midi.REC_UpdateValue | midi.REC_UpdateControl)
+    return general.processRECEvent(event, 0, midi.REC_GetValue)
+
+def req_set_mixer_track(track, name=None, color=None, volume=None, db=None, pan=None, sep=None, muted=None,
+                        solo=None, armed=None, fx_on=None, sends=None, slot_mix=None, slot_on=None):
+    t = find_mixer_track(track)
+    if name is not None:
+        mixer.setTrackName(t, name)
+    if color is not None:
+        mixer.setTrackColor(t, color)
+    if db is not None:
+        set_db(lambda v: mixer.setTrackVolume(t, v, midi.PIM_None), lambda: mixer.getTrackVolume(t, 1), db)
+    elif volume is not None:
+        mixer.setTrackVolume(t, volume, midi.PIM_None)
+    if pan is not None:
+        mixer.setTrackPan(t, pan, midi.PIM_None)
+    if sep is not None:
+        mixer.setTrackStereoSep(t, sep, midi.PIM_None)
+    if muted is not None:
+        mixer.muteTrack(t, int(muted))
+    if solo is not None:
+        mixer.soloTrack(t, int(solo))
+    if armed is not None and bool(mixer.isTrackArmed(t)) != armed:
+        mixer.armTrack(t)
+    if fx_on is not None:
+        mixer.enableTrackSlots(t, int(fx_on))
+    for dest, level in (sends or {}).items():
+        # level: a 0-1 send level, True (route at the current level) or False (unroute)
+        d = find_mixer_track(dest)
+        mixer.setRouteTo(t, d, int(level is not False))
+        if not isinstance(level, bool):
+            mixer.setRouteToLevel(t, d, float(level))
+    if sends:
+        mixer.afterRoutingChanged()
+    for slot, level in (slot_mix or {}).items():
+        mixer.setPluginMixLevel(t, effect_slot(t, slot), float(level), midi.PIM_None)
+    for slot, on in (slot_on or {}).items():
+        slot_switch(t, effect_slot(t, slot), int(on))
+    data = req_get_mixer_track(t)
+    data["color"] = rgb(mixer.getTrackColor(t))
+    data["slot_mix"] = {e["slot"]: finite(mixer.getPluginMixLevel(t, e["slot"]), 3) for e in data["effects"]}
+    data["slot_on"] = {e["slot"]: e["on"] for e in data["effects"]}
+    return data
+
+def plugin_target(channel=None, track=None, slot=None):
+    """(index, slot, useGlobalIndex) of a channel's plugin, or of the effect in a mixer track's slot"""
+    if channel is not None:
+        c = find_channel(channel)
+        if not plugins.isValid(c, -1, True):
+            raise ValueError(f"Channel {channel!r} has no plugin (it may be an audio sample)")
+        return c, -1, True
+    if track is None or slot is None:
+        raise ValueError("Give a channel, or a mixer track and slot")
+    t = find_mixer_track(track)
+    return t, effect_slot(t, slot), False
+
+def find_param(param, plugin):
+    """Parameter index from an index, or a name or its start (case-insensitive)"""
+    count = min(plugins.getParamCount(*plugin), 4096)  # 4096+ are MIDI CC mappings
+    if isinstance(param, int) or str(param).strip().isdigit():
+        if not 0 <= int(param) < count:
+            raise ValueError(f"Parameter {param} doesn't exist (0-{count - 1})")
+        return int(param)
+    names = [plugins.getParamName(i, *plugin) for i in range(count)]
+    matches = match_names(param, names)
+    if len(matches) == 1 or (matches and names[matches[0]].lower() == str(param).strip().lower()):
+        return matches[0]  # with duplicate names, the first
+    raise no_match("parameter", param, [n for n in names if n], matches)
+
+def param_state(p, plugin):
+    return {"index": p, "name": plugins.getParamName(p, *plugin),
+            "value": finite(plugins.getParamValue(p, *plugin), 4),
+            "display": plugins.getParamValueString(p, *plugin).strip() or None}
+
+def req_set_param(param, value, channel=None, track=None, slot=None):
+    """Set a plugin parameter to a 0-1 value"""
+    plugin = plugin_target(channel, track, slot)
+    p = find_param(param, plugin)
+    plugins.setParamValue(float(value), p, plugin[0], plugin[1], midi.PIM_None, plugin[2])
+    return param_state(p, plugin)
+
+def req_param_state(param, channel=None, track=None, slot=None):
+    """A plugin parameter's value and text (some plugins, like Vital, update the text only
+    after the request that set it)"""
+    plugin = plugin_target(channel, track, slot)
+    return param_state(find_param(param, plugin), plugin)
+
+def req_probe_param(param, values, channel=None, track=None, slot=None):
+    """A parameter's display text at each 0-1 value (to find the value for a text like "-6 dB");
+    the parameter is put back afterwards"""
+    plugin = plugin_target(channel, track, slot)
+    p = find_param(param, plugin)
+    original = plugins.getParamValue(p, *plugin)
+    texts = []
+    try:
+        for value in values:
+            plugins.setParamValue(float(value), p, plugin[0], plugin[1], midi.PIM_None, plugin[2])
+            texts.append(plugins.getParamValueString(p, *plugin).strip())
+    finally:
+        plugins.setParamValue(original, p, plugin[0], plugin[1], midi.PIM_None, plugin[2])
+    return dict(param_state(p, plugin), texts=texts)
+
+def req_preset(steps=0, names=False, channel=None, track=None, slot=None):
+    """Move steps presets forward (negative: back). Returns the preset count and the current
+    preset's name, which FL updates only after the request returns: read it with steps=0.
+    names: also each preset's name (only some plugins name them)."""
+    plugin = plugin_target(channel, track, slot)
+    for _ in range(abs(steps)):
+        (plugins.nextPreset if steps > 0 else plugins.prevPreset)(*plugin)
+    preset_name = lambda i: plugins.getName(plugin[0], plugin[1], midi.FPN_Preset, i, plugin[2])
+    count = plugins.getPresetCount(*plugin)
+    result = {"count": count, "current": preset_name(-1)}
+    if names:
+        result["names"] = [preset_name(i) for i in range(count)]
+    return result
+
+def req_set_pattern(pattern=None, clone=False, name=None, color=None):
+    """Change a pattern, a new clone of it (FL puts it after the pattern), or (no pattern) a new
+    empty one; a new one becomes the active pattern. (setPatternLength needs API v39.)"""
+    if pattern is None:
+        patterns.findFirstNextEmptyPat(midi.FFNEP_DontPromptName)
+        p = patterns.patternNumber()
+    else:
+        found = find_patterns(pattern)
+        if len(found) > 1:
+            raise ValueError(f"Patterns {found} are all named {pattern!r}: use a number")
+        p = found[0]
+        if clone:
+            patterns.clonePattern(p)
+            p = patterns.patternNumber()
+    if name is not None:
+        patterns.setPatternName(p, name)
+    if color is not None:
+        patterns.setPatternColor(p, color)
+    return {"pattern": p, "name": patterns.getPatternName(p)}
+
+def find_playlist_track(track):
+    """Playlist track number (1 = first) from a number, or a name or its start (case-insensitive)"""
+    count = playlist.trackCount()
+    if isinstance(track, int) or str(track).strip().isdigit():
+        if not 1 <= int(track) <= count:
+            raise ValueError(f"Playlist track {track} doesn't exist (1-{count})")
+        return int(track)
+    names = [playlist.getTrackName(t) for t in range(1, count + 1)]
+    matches = match_names(track, names)
+    if len(matches) == 1 or (matches and names[matches[0]].lower() == str(track).strip().lower()):
+        return matches[0] + 1
+    raise no_match("playlist track", track, names, matches)
+
+def req_set_playlist_track(track, name=None, color=None, muted=None, solo=None):
+    t = find_playlist_track(track)
+    if name is not None:
+        playlist.setTrackName(t, name)
+    if color is not None:
+        playlist.setTrackColor(t, color)
+    if muted is not None:
+        playlist.muteTrack(t, int(muted))
+    if solo is not None:
+        playlist.soloTrack(t, int(solo))
+    return {"track": t, "name": playlist.getTrackName(t), "color": rgb(playlist.getTrackColor(t)),
+            "muted": bool(playlist.isTrackMuted(t)), "solo": bool(playlist.isTrackSolo(t))}
+
+# Automation is recorded the way a MIDI controller records it: with FL recording,
+# each value sent as a REC event with REC_Store lands in the active pattern's event
+# data (or wherever FL's record settings put it). automation_start starts FL playing
+# and recording; the server then calls automation_tick as fast as it can, which sends
+# the ramp's value at FL's current song position, and stops FL after the last point.
+MIXER_EVENTS = {"volume": midi.REC_Mixer_Vol, "pan": midi.REC_Mixer_Pan, "sep": midi.REC_Mixer_SS}
+automation = {}
+
+def automation_event(param, channel=None, track=None, slot=None):
+    """(REC event id, name) of a plugin parameter, a mixer effect's "mix" level, or (track
+    without slot) a mixer track's volume/pan/sep"""
+    if track is not None and slot is None:
+        if param not in MIXER_EVENTS:
+            raise ValueError(f"Without a slot, param is one of {list(MIXER_EVENTS)}")
+        return mixer.getTrackPluginId(find_mixer_track(track), 0) + MIXER_EVENTS[param], param
+    plugin = plugin_target(channel, track, slot)
+    if channel is None and param == "mix":
+        return mixer.getTrackPluginId(plugin[0], plugin[1]) + midi.REC_Plug_MixLevel, "mix"
+    p = find_param(param, plugin)
+    base = (channels.getRecEventId(plugin[0], True) + midi.REC_Chan_Plugin_First if channel is not None
+            else mixer.getTrackPluginId(plugin[0], plugin[1]) + midi.REC_Plug_Plugin_First)
+    return base + p, plugins.getParamName(p, *plugin)
+
+def send_value(event, value, flags):
+    general.processRECEvent(event, int(round(min(max(value, 0.0), 1.0) * midi.FromMIDI_Max)),
+                            flags | midi.REC_FromMIDI)
+
+def ramp_value(points, tick):
+    """Linear ramp through points [(tick, value)], held before the first and after the last"""
+    tick = max(tick, points[0][0])
+    for (t0, v0), (t1, v1) in zip(points, points[1:]):
+        if tick <= t1:
+            return v0 if t1 == t0 else v0 + (v1 - v0) * (tick - t0) / (t1 - t0)
+    return points[-1][1]
+
+def req_automation_start(param, points, channel=None, track=None, slot=None):
+    if transport.isPlaying():
+        raise ValueError("FL Studio is playing: stop it first")
+    armed = [t for t in range(last_mixer_track() + 1) if mixer.isTrackArmed(t)]
+    if armed:
+        raise ValueError(f"Mixer tracks {armed} are armed for recording audio: disarm them first")
+    event, name = automation_event(param, channel, track, slot)
+    ppq = general.getRecPPQ()
+    ticks = sorted((float(beat) * ppq, float(value)) for beat, value in points)
+    song = transport.getLoopMode() == 1
+    if not song and ticks[-1][0] > pattern_beats(patterns.patternNumber()) * ppq:
+        raise ValueError(f"The last point is past the end of the pattern ({pattern_beats(patterns.patternNumber()):g} beats), "
+                         "where FL would loop: use a longer pattern or song mode")
+    send_value(event, ticks[0][1], midi.REC_UpdateValue | midi.REC_UpdateControl)
+    automation.clear()
+    automation.update(event=event, points=ticks, last=ticks[0][0])
+    transport.setSongPos(int(ticks[0][0]), SONGLENGTH_ABSTICKS)
+    if not transport.isRecording():
+        transport.record()
+    transport.start()
+    return {"param": name, "into": "song" if song else f"pattern {patterns.getPatternName(patterns.patternNumber())!r}"}
+
+def req_automation_tick():
+    """Send the ramp's value at the song position; after the last point, stop FL and its recording"""
+    if not automation:
+        raise ValueError("No automation is being recorded")
+    tick = transport.getSongPos(SONGLENGTH_ABSTICKS)
+    points = automation["points"]
+    # Done after the last point, when FL stopped, or when the position wrapped (pattern loop)
+    done = tick >= points[-1][0] or tick < automation["last"] or not transport.isPlaying()
+    if tick >= points[0][0] or done:
+        send_value(automation["event"], ramp_value(points, points[-1][0] if done else tick), midi.REC_MIDIController)
+    automation["last"] = tick
+    if done:
+        transport.stop()
+        if transport.isRecording():
+            transport.record()
+        automation.clear()
+    return {"beat": round(tick / general.getRecPPQ(), 3), "done": done}
 
 def req_undo_state():
     """Undo history position: 0 = most recent action, higher = further back;
@@ -432,7 +763,74 @@ def req_run_keybind(combo):
         print(f"keybinds: {combo} failed: {type(e).__name__}: {e}")
         raise
 
+API_MODULES = ("arrangement", "channels", "device", "general", "mixer", "patterns", "playlist", "plugins",
+               "transport", "ui")
+
+def req_api_names(module):
+    """Function names one FL API module has in this FL version (they vary by version)"""
+    if module not in API_MODULES:
+        raise ValueError(f"module is one of {API_MODULES}")
+    return [n for n in dir(importlib.import_module(module)) if not n.startswith("_")]
+
+def req_song_state():
+    """Song-mode facts for the playlist: song length, time selection, performance mode"""
+    import arrangement
+    ppq = general.getRecPPQ()
+    state = {"mode": "song" if transport.getLoopMode() else "pattern", "ppq": ppq,
+             "song_length_beats": transport.getSongLength(SONGLENGTH_ABSTICKS) / ppq,
+             "selection_beats": [arrangement.selectionStart() / ppq, arrangement.selectionEnd() / ppq],
+             "performance_mode": playlist.getPerformanceModeState()}
+    return state
+
+# --- Playlist (mouse) -----------------------------------------------------------
+# No API places clips or edits arrangements, so the server uses the mouse (only while
+# the user allows it): these prepare the playlist and read FL's hint bar, which names
+# what's under the mouse, so each click is checked before and after.
+
+def req_playlist_view(bar=None, track=None, snap=None, pattern=None):
+    """Show and focus the playlist; scroll so bar is at its left edge and track at the top,
+    set the snap (midi.Snap_*) and the active pattern (the draw tool's clip). Returns what to
+    put back and the timing facts."""
+    before = {"vis_bar": playlist.getVisTimeBar(), "snap": ui.getSnapMode(), "pattern": patterns.patternNumber()}
+    ui.showWindow(midi.widPlaylist)
+    ui.setFocused(midi.widPlaylist)
+    if bar is not None:
+        ui.scrollWindow(midi.widPlaylist, int(bar), 1)
+    if track is not None:
+        ui.scrollWindow(midi.widPlaylist, find_playlist_track(track), 0)
+    if snap is not None:
+        ui.setSnapMode(snap)
+    if pattern is not None:
+        found = find_patterns(pattern)
+        if len(found) > 1:
+            raise ValueError(f"Patterns {found} are all named {pattern!r}: use a number")
+        if found[0] != patterns.patternNumber():
+            patterns.jumpToPattern(found[0])
+    return dict(before, ppq=general.getRecPPQ(), ppb=general.getRecPPB())
+
+ARRANGEMENT_HINT = "Current playlist arrangement: "
+
+def req_arrangement_jog(step):
+    """Switch to the next (step 1) or previous (-1) arrangement; no API names arrangements,
+    but FL's hint does after a switch. Returns the new current one's name, or None when there
+    was none to switch to."""
+    ui.setHintMsg("")
+    transport.globalTransport(midi.FPT_ArrangementJog, int(step))
+    hint = ui.getHintMsg()
+    return hint[len(ARRANGEMENT_HINT):] if hint.startswith(ARRANGEMENT_HINT) else None
+
+def req_hint():
+    """FL's hint bar text (describes what's under the mouse) and the focused window"""
+    return {"hint": ui.getHintMsg(), "focused": ui.getFocusedFormCaption(), "form_id": ui.getFocusedFormID(),
+            "vis_bar": playlist.getVisTimeBar(), "vis_step": playlist.getVisTimeStep(),
+            "vis_tick": playlist.getVisTimeTick()}
+
 REQUEST_HANDLERS = {
+    "playlist_view": req_playlist_view,
+    "hint": req_hint,
+    "arrangement_jog": req_arrangement_jog,
+    "api_names": req_api_names,
+    "song_state": req_song_state,
     "keybinds": req_keybinds,
     "run_keybind": req_run_keybind,
     "transport_state": req_transport_state,
@@ -444,6 +842,9 @@ REQUEST_HANDLERS = {
     "undo_move": req_undo_move,
     "ping": lambda: "pong",
     "get_mixer_track": req_get_mixer_track,
+    "select": req_select,
+    "browser": req_browser,
+    "active_effect": req_active_effect,
     "get_channel": req_get_channel,
     "prepare_piano_roll": req_prepare_piano_roll,
     "piano_roll_step": req_piano_roll_step,
@@ -453,4 +854,14 @@ REQUEST_HANDLERS = {
     "get_pattern": req_get_pattern,
     "get_all_patterns": req_get_all_patterns,
     "get_plugin_params": req_get_plugin_params,
+    "set_channel": req_set_channel,
+    "set_mixer_track": req_set_mixer_track,
+    "set_param": req_set_param,
+    "param_state": req_param_state,
+    "probe_param": req_probe_param,
+    "preset": req_preset,
+    "set_pattern": req_set_pattern,
+    "set_playlist_track": req_set_playlist_track,
+    "automation_start": req_automation_start,
+    "automation_tick": req_automation_tick,
 }

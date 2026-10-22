@@ -2,8 +2,11 @@
 The flstudio MCP server's tools. Every function in TOOLS is registered by
 trigger.py and re-registered when the reload_server tool reloads this module.
 """
+import contextlib
+import difflib
 import inspect
 import queue
+import re
 import sys
 import time
 
@@ -11,8 +14,12 @@ import mido
 from mido import Message
 
 from fl_bridge import (CC_TEMPO_LSB, CC_TEMPO_MSB, CC_TEMPO_REPLY_LSB, CC_TEMPO_REPLY_MSB,
-                       CC_TEMPO_REQUEST, INPUT_PORT_NAME, FLStudioError, ensure_listener, fl_log,
-                       fl_request, run_export_notes, send, tempo_replies)
+                       CC_TEMPO_REQUEST, FL_USER_DATA_DIR, INPUT_PORT_NAME, VK_CONTROL, VK_ESCAPE, VK_L,
+                       VK_R, VK_RETURN, VK_RIGHT, VK_UP, FLStudioError, ensure_listener, fl_in_front, fl_install_dir,
+                       child_windows, click, cursor_kept, fl_log, fl_main_window, fl_request, focus_kept, hover,
+                       fl_top_window, open_in_fl, press_keys, require, run_export_notes, save_permissions,
+                       screen_colors, send, tempo_replies, type_text, uncovered, window_dpi, window_rect,
+                       window_title)
 
 # Drum sound MIDI notes
 KICK = 36      # C1
@@ -490,7 +497,7 @@ def get_mixer_track(track: str, fields: list[str] | None = None):
     A mixer track's data.
     track: number (0 = Master; get_channel's mixer_track), or name or its start.
     fields: name volume(v: 0-1) volume_db(db) pan(p: -1..1) stereo_separation(sep) muted(mu)
-      solo(so) armed(a) effects_enabled(fxon) effects(fx: {slot: plugin}) sends_to(sends:
+      solo(so) armed(a) effects_enabled(fxon) effects(fx: {slot: plugin, "+ (off)" if off}) sends_to(sends:
       {track: level}) channels(ch: channels routed in). Default: all.
     One field returns its bare value; several a dict.
     """
@@ -499,21 +506,891 @@ def get_mixer_track(track: str, fields: list[str] | None = None):
     if unknown:
         raise ValueError(f"Unknown fields {unknown}. Choose from {field_choices(MIXER_TRACK_FIELDS)}")
     data = fl_request("get_mixer_track", track=track)
-    data["effects"] = {str(e["slot"]): e.get("name", e["plugin"]) for e in data["effects"]}
+    data["effects"] = {str(e["slot"]): e.get("name", e["plugin"]) + ("" if e["on"] else " (off)")
+                       for e in data["effects"]}
     data["sends_to"] = {s["name"]: s["level"] for s in data["sends_to"]}
     return pick(data, fields)
 
-def get_plugin_params(channel: str, name_filter: str = "", limit: int = 200):
+def set_permissions(mouse: bool | None = None, focus: bool | None = None):
     """
-    Settings of a channel's plugin: {param: display text, else 0-1 value}; "_more": true
-    if cut at limit. Defaults aren't available.
-    channel: as get_channel. name_filter: only names containing this (case-insensitive).
+    Switch what FL tools may do. Only when the user explicitly says so. mouse: clicking in
+    FL (default off). focus: bringing FL to the front for a moment for shortcut keys (default
+    on). Saved until changed; tools refuse what's off. Returns both.
     """
-    data = fl_request("get_plugin_params", timeout=30.0, channel=channel, name_filter=name_filter, limit=limit)
+    return save_permissions(mouse=mouse, focus=focus)
+
+def plugin_args(channel, track, slot):
+    """Request args for a channel's plugin, or the effect in a mixer track's slot"""
+    if bool(channel) == bool(track):
+        raise ValueError("Give either channel, or track and slot")
+    return {"channel": channel} if channel else {"track": track, "slot": slot}
+
+def get_plugin_params(channel: str = "", track: str = "", slot: int | None = None, name_filter: str = "",
+                      limit: int = 200):
+    """
+    Settings of a channel's plugin, or of the effect in a mixer track's slot (0-9):
+    {param: display text, else 0-1 value}; "_more": true if cut at limit. Defaults aren't available.
+    channel: as get_channel. track: as get_mixer_track. name_filter: only names containing this.
+    """
+    data = fl_request("get_plugin_params", timeout=30.0, name_filter=name_filter, limit=limit,
+                      **plugin_args(channel, track, slot))
     params = {p["name"]: p["display"] if p["display"] is not None else p["value"] for p in data["params"]}
     if data["returned"] >= limit:
         params["_more"] = True
     return params
+
+# A value given as display text ("-6 dB", "1.2 kHz", "Low pass") is found by probing:
+# FL reports a parameter's text only for its current value, so probe_param sets a row of
+# values, reads each text and puts the parameter back. Numbers are bracketed and the
+# bracket narrowed a few times; other texts are matched against the labels seen.
+UNIT_PREFIXES = {"k": 1e3, "m": 1e-3, "µ": 1e-6, "u": 1e-6}
+NUMBER = re.compile(r"([-+]?(?:inf|\d+(?:[.,]\d+)?|[.,]\d+))\s*([^\d\s]*)", re.IGNORECASE)
+
+def parse_number(text):
+    """(value in base units, unit) of a display text such as "1.2 kHz" -> (1200, "hz"), else None"""
+    match = NUMBER.search(text or "")
+    if not match:
+        return None
+    value, unit = float(match[1].replace(",", ".")), match[2].lower()
+    if len(unit) > 1 and unit[0] in UNIT_PREFIXES and unit[1:] in ("hz", "s"):
+        value, unit = value * UNIT_PREFIXES[unit[0]], unit[1:]
+    elif unit == "k":
+        value, unit = value * 1e3, ""
+    return value, unit
+
+def param_value(text, probe):
+    """The 0-1 value at which a parameter displays text; probe(values) -> their texts"""
+    grid = [i / 64 for i in range(65)]
+    texts = probe(grid)
+    target = parse_number(text)
+    if target is None:
+        values, labels = grid, texts
+        for _ in range(2):  # then a finer row, for labels the first one skipped
+            for match in (lambda t: t.lower() == text.lower(), lambda t: t.lower().startswith(text.lower())):
+                hits = [v for v, t in zip(values, labels) if match(t)]
+                if hits:
+                    return hits[len(hits) // 2]
+            values = [i / 512 for i in range(513)]
+            labels = probe(values)
+        raise ValueError(f"No value shows {text!r}. It shows e.g. {', '.join(dict.fromkeys(labels))[:300]}")
+    numbers = [parse_number(t) for t in texts]
+    units = {n[1] for n in numbers if n}
+    if target[1] and units and target[1] not in units:
+        raise ValueError(f"This parameter shows {texts[0]!r} to {texts[-1]!r}, not {target[1]!r}")
+    best = min((abs(n[0] - target[0]), v) for v, n in zip(grid, numbers) if n)[1] if units else None
+    if best is None:
+        raise ValueError(f"This parameter shows no numbers ({texts[0]!r} to {texts[-1]!r})")
+    low, high = max(best - 1 / 64, 0.0), min(best + 1 / 64, 1.0)
+    for _ in range(3):  # narrow around the closest value
+        values = [low + (high - low) * i / 32 for i in range(33)]
+        numbers = [parse_number(t) for t in probe(values)]
+        best = min((abs(n[0] - target[0]), v) for v, n in zip(values, numbers) if n)[1]
+        step = (high - low) / 32
+        low, high = max(best - step, 0.0), min(best + step, 1.0)
+    return best
+
+def resolve_value(value, param, args):
+    """A 0-1 value as given, or the one for a display text"""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if not 0 <= value <= 1:
+            raise ValueError("A number value must be 0-1; give FL's display text (e.g. \"-6 dB\") otherwise")
+        return float(value)
+    text = str(value).strip()
+    try:
+        return resolve_value(float(text), param, args)
+    except ValueError:
+        pass
+    return param_value(text, lambda values: fl_request("probe_param", param=param, values=values, **args)["texts"])
+
+def set_plugin_param(param: str, value: float | str, channel: str = "", track: str = "", slot: int | None = None):
+    """
+    Set a parameter of a channel's plugin, or of the effect in a mixer track's slot (0-9).
+    param: name or its start (as get_plugin_params), or index. value: 0-1, or the text FL
+    shows, e.g. "-6 dB", "1.2 kHz", "50%", "Low pass" (found by trying values).
+    channel: as get_channel. track: as get_mixer_track. Returns the text FL shows (else the 0-1 value).
+    """
+    args = plugin_args(channel, track, slot)
+    target = resolve_value(value, param, args)
+    read = lambda: fl_request("param_state", param=param, **args)
+    before = read()
+    fl_request("set_param", param=param, value=target, **args)
+    # Some plugins (Vital) update the text a moment later
+    data = wait_for(read, lambda d: d["display"] != before["display"] or abs(before["value"] - target) < 1e-6, 1.0)
+    return data["display"] if data["display"] is not None else data["value"]
+
+def current_preset(args):
+    """The plugin's current preset name, which FL updates just after a preset request returns"""
+    time.sleep(0.1)
+    return fl_request("preset", **args)["current"]
+
+def change_preset(steps: int = 1, name: str = "", channel: str = "", track: str = "", slot: int | None = None):
+    """
+    Change the preset of a channel's plugin or of the effect in a mixer track's slot (0-9):
+    steps forward (negative: back), or to the one called name (or its start; only plugins
+    that name their presets). channel: as get_channel. track: as get_mixer_track.
+    Returns the preset's name ("" if FL has none). FL renames a VST's channel after its preset.
+    """
+    args = plugin_args(channel, track, slot)
+    if channel:  # the channel may be renamed after its preset: keep to its index
+        args["channel"] = str(fl_request("get_channel", channel=channel, fields=[])["index"])
+    if not name:
+        fl_request("preset", steps=steps, **args)
+        return current_preset(args)
+    info = fl_request("preset", names=True, **args)
+    names = [n.lower() for n in info["names"]]
+    query = name.strip().lower()
+    matches = ([i for i, n in enumerate(names) if n == query] or [i for i, n in enumerate(names) if n.startswith(query)]
+               or [i for i, n in enumerate(names) if query in n])
+    if not matches:
+        raise ValueError(f"No preset {name!r}. Presets: {', '.join(n for n in info['names'] if n)[:400]}")
+    target, current = matches[0], info["current"].lower()
+    if names.count(current) != 1:  # no preset chosen yet, or a name used twice: step to a known one
+        fl_request("preset", steps=1, **args)
+        current = current_preset(args).lower()
+    if names.count(current) == 1:
+        forward = (target - names.index(current)) % len(names)
+        fl_request("preset", steps=forward if forward <= len(names) / 2 else forward - len(names), **args)
+    return current_preset(args)
+
+def color_value(color):
+    """FL's color int from "#RRGGBB" (or "RRGGBB", "0xRRGGBB")"""
+    text = str(color).strip().lstrip("#")
+    text = text[2:] if text.lower().startswith("0x") else text
+    if not re.fullmatch(r"[0-9a-fA-F]{6}", text):
+        raise ValueError(f'color must be like "#FF8800", not {color!r}')
+    return int(text, 16)
+
+def set_values(cmd, given, renamed=None, **ids):
+    """Send a set_* request with the given values (None = unchanged; color as "#RRGGBB") and
+    return just those values as FL now has them (renamed: request key -> result key)"""
+    given = {k: v for k, v in given.items() if v is not None}
+    if not given:
+        raise ValueError("Nothing to change")
+    data = fl_request(cmd, **ids, **{k: color_value(v) if k == "color" else v for k, v in given.items()})
+    data["color"] = f"#{data['color']:06X}"
+    if isinstance(data.get("sends_to"), list):
+        data["sends_to"] = {s["name"]: s["level"] for s in data["sends_to"]}
+    return pick(data, [(renamed or {}).get(k, k) for k in given])
+
+def set_channel(channel: str, name: str | None = None, color: str | None = None, volume: float | None = None,
+                db: float | None = None, pan: float | None = None, muted: bool | None = None,
+                solo: bool | None = None, track: str | None = None):
+    """
+    Change a channel; give only what to change. channel: as get_channel.
+    color: "#RRGGBB". volume: 0-1 fader, or db in dB. pan: -1..1.
+    track: mixer track to route it to (as get_mixer_track), or "free": FL's Ctrl+L, to a free
+    track named after the channel (FL comes to the front briefly).
+    Returns the changed values as FL now has them (one value bare).
+    """
+    warnings = []
+    given = dict(name=name, color=color, volume=volume, db=db, pan=pan, muted=muted, solo=solo)
+    if track is not None and str(track).strip().lower() == "free":
+        free = assign_free_mixer_track(channel, warnings)
+        if not any(v is not None for v in given.values()):
+            return with_warnings(free, warnings)
+        track = None
+    given["mixer_track"] = track
+    result = set_values("set_channel", given, {"db": "volume_db"}, channel=channel)
+    return with_warnings(result, warnings)
+
+def set_mixer_track(track: str, name: str | None = None, color: str | None = None, volume: float | None = None,
+                    db: float | None = None, pan: float | None = None, sep: float | None = None,
+                    muted: bool | None = None, solo: bool | None = None, armed: bool | None = None,
+                    fx_on: bool | None = None, sends: dict | None = None, slot_mix: dict | None = None,
+                    slot_on: dict | None = None):
+    """
+    Change a mixer track; give only what to change. track: as get_mixer_track.
+    color: "#RRGGBB". volume: 0-1 fader (0.8 = 0 dB), or db in dB. pan, sep: -1..1.
+    fx_on: the track's effect slots switch. sends: {track: 0-1 level, true (route) or false
+    (unroute)}. slot_mix: {slot: 0-1 effect mix}. slot_on: {slot: bool}.
+    Returns the changed values as FL now has them (one value bare).
+    """
+    given = dict(name=name, color=color, volume=volume, db=db, pan=pan, sep=sep, muted=muted, solo=solo,
+                 armed=armed, fx_on=fx_on, sends=sends, slot_mix=slot_mix, slot_on=slot_on)
+    return set_values("set_mixer_track", given, {"db": "volume_db", "sep": "stereo_separation",
+                                                 "fx_on": "effects_enabled", "sends": "sends_to"}, track=track)
+
+def set_pattern(pattern: str = "", clone: bool = False, name: str | None = None, color: str | None = None):
+    """
+    Rename/recolor a pattern, or a new clone of it (clone: FL puts it after the pattern), or
+    without pattern a new empty one; a new one becomes the active pattern.
+    pattern: number, or name or its start. color: "#RRGGBB". Returns {pattern, name}.
+    """
+    if pattern and not clone and name is None and color is None:
+        raise ValueError("Nothing to change")
+    return fl_request("set_pattern", pattern=pattern or None, clone=clone, name=name,
+                      color=None if color is None else color_value(color))
+
+def set_playlist_track(track: str, name: str | None = None, color: str | None = None, muted: bool | None = None,
+                       solo: bool | None = None):
+    """
+    Change a playlist track; give only what to change. track: number (1 = first), or name or
+    its start. color: "#RRGGBB". Returns the changed values as FL now has them (one value bare).
+    """
+    return set_values("set_playlist_track", dict(name=name, color=color, muted=muted, solo=solo), track=track)
+
+# --- Playlist clips with the mouse (only while the user allows it) --------------
+# No API places or deletes clips, so FL's draw tool does it. Positions come from FL,
+# not from pictures: the playlist's child windows bound the grid, FL's hint bar names
+# the time ("bar:step:tick") or the track under the mouse, and the target track is
+# renamed for the moment so its row can be found by name. Before each click the window
+# under it must be the playlist, the hint must show the target time and the track
+# column the target track.
+HINT_TIME = re.compile(r"^(\d+):(\d+):(\d+)$")
+ROW_TOKEN = "@mcp-target@"
+VK_P = 0x50  # the playlist's draw tool
+
+def hint_ticks(text, ppq, ppb):
+    """Ticks from the song start for a hint like "21:12:05" (bar:16th step:tick), else None"""
+    match = HINT_TIME.match(text)
+    return None if match is None else (int(match[1]) - 1) * ppb + (int(match[2]) - 1) * ppq // 4 + int(match[3])
+
+def playlist_layout():
+    """(the playlist form, its grid rect (left, top, right, bottom) with the ruler, the x of the
+    track names column), from FL's child windows: a scroller spans the grid's width above it
+    and a scroll bar runs down its right side"""
+    main = fl_main_window()[0]
+    form = next((hwnd for hwnd, cls, title, _, visible in child_windows(main)
+                 if cls == "TEventEditForm" and title.startswith("Playlist") and visible), None)
+    if form is None:
+        raise FLStudioError("FL Studio's playlist isn't showing.")
+    inner = [(cls, rect) for _, cls, _, rect, visible in child_windows(form) if visible]
+    scroller = next((rect for cls, rect in inner if cls == "TQuickScroller"), None)
+    scroll_bars = sorted((rect for cls, rect in inner if cls == "TNumBar"), key=lambda rect: rect[0])
+    if scroller is None or not scroll_bars:
+        raise FLStudioError("Couldn't find the playlist's grid (FL Studio's layout differs from what's expected).")
+    left, right = scroller[0], scroller[2]
+    # With the picker panel showing, its scroll bar is the first one, left of the track names
+    names_x = (scroll_bars[0][2] + left) // 2 if len(scroll_bars) > 1 else left - 100
+    return form, (left, scroller[3], right, scroll_bars[-1][3]), names_x
+
+class PlaylistMouse:
+    """FL in front, the playlist scrolled to a bar and track, the target track renamed to
+    ROW_TOKEN, covering FL windows hidden as needed; everything is put back on exit"""
+
+    def __init__(self, track, bar, pattern=None):
+        self.track, self.bar, self.pattern = track, bar, pattern
+        self.warnings = []
+
+    def __enter__(self):
+        require("mouse", "focus")
+        target = fl_request("set_playlist_track", track=self.track)
+        self.track, self.name = target["track"], target["name"]
+        self.exits = contextlib.ExitStack()
+        try:
+            self.exits.enter_context(fl_in_front(self.warnings))
+            self.exits.enter_context(cursor_kept())
+            # The target bar a bar in from the left edge, the target track at the top
+            view = fl_request("playlist_view", bar=max(1, int(self.bar) - 1), track=self.track, pattern=self.pattern)
+            self.exits.callback(fl_request, "playlist_view", bar=view["vis_bar"], pattern=view["pattern"])
+            default = self.name == f"Track {self.track}"
+            fl_request("set_playlist_track", track=self.track, name=ROW_TOKEN)
+            self.exits.callback(fl_request, "set_playlist_track", track=self.track, name="" if default else self.name)
+            self.ppq, self.ppb = view["ppq"], view["ppb"]
+            self.form, self.grid, self.names_x = playlist_layout()
+            self.clear = self.exits.enter_context(uncovered(self.form))
+        except BaseException:
+            self.exits.close()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.exits.close()
+
+    def hint(self, x, y):
+        self.clear(x, y)
+        hover(x, y)
+        return fl_request("hint")["hint"].strip()
+
+    def x_of(self, ticks):
+        """The x of a time in the grid, from two times read on the ruler (once)"""
+        if not hasattr(self, "x_ticks"):
+            left, top, right, _ = self.grid
+            xs = (left + (right - left) * 0.1, right - (right - left) * 0.1)
+            read = [hint_ticks(self.hint(x, top + 8), self.ppq, self.ppb) for x in xs]
+            if None in read or read[0] == read[1]:
+                raise FLStudioError("Couldn't read the playlist's time scale from FL's hint bar.")
+            self.x_ticks = (xs[0], read[0], (xs[1] - xs[0]) / (read[1] - read[0]))
+        x0, t0, per_tick = self.x_ticks
+        return x0 + (ticks - t0) * per_tick
+
+    def row(self):
+        """(top, bottom) y of the target track's row: scan the track names column, then bisect"""
+        _, top, _, bottom = self.grid
+        is_target = lambda y: self.hint(self.names_x, y) == ROW_TOKEN
+        y = top
+        while y < bottom and not is_target(y):
+            y += 8
+        if y >= bottom:
+            raise FLStudioError(f"Couldn't find playlist track {self.track}'s row.")
+
+        def edge(inside, outside):
+            while abs(inside - outside) > 1:
+                middle = (inside + outside) // 2
+                inside, outside = (middle, outside) if is_target(middle) else (inside, middle)
+            return inside
+        row_top = edge(y, y - 8)
+        below = y + 16
+        while below < bottom and is_target(below):
+            below += 16
+        return row_top, edge(below - 16, min(below, bottom))
+
+    def row_middle(self):
+        row_top, row_bottom = self.row()
+        return (row_top + row_bottom) / 2
+
+    def checked(self, x, y):
+        """FL's hint at (x, y), after checking the spot is in the target track's row"""
+        if not self.grid[0] <= x < self.grid[2]:
+            raise FLStudioError("That time isn't visible in the playlist; nothing clicked.")
+        if self.hint(self.names_x, y) != ROW_TOKEN:
+            raise FLStudioError("The playlist's track rows moved; nothing clicked.")
+        return self.hint(x, y)
+
+    def clip_at(self, x, y):
+        """(start, length) in ticks of the clip FL's hint names at (x, y), or None. Over a clip
+        the hint is "start for length", e.g. "3:06:00 for 2:00:00" (a length counts from 0)."""
+        text = self.checked(x, y)
+        if " for " not in text:
+            return None
+        start, length = text.split(" for ", 1)
+        bars, steps, ticks = (int(n) for n in length.split(":"))
+        return hint_ticks(start, self.ppq, self.ppb), bars * self.ppb + steps * self.ppq // 4 + ticks
+
+def clip_ticks(bar, ppq, ppb):
+    """Ticks from the song start of a 1-based bar given in whole beats"""
+    beats = (bar - 1) * ppb / ppq
+    if bar < 1 or abs(beats - round(beats)) > 1e-6:
+        raise ValueError("bar must be 1 or more, in whole beats (e.g. 3, or 3.25 = bar 3 beat 2 in 4/4)")
+    return round(beats) * ppq
+
+def tick_text(ticks, ppq, ppb):
+    bars, rest = divmod(ticks, ppb)
+    return f"{bars + 1}:{rest // (ppq // 4) + 1:02d}:{rest % (ppq // 4):02d}"
+
+def clip_text(clip, ppq, ppb):
+    return f"{tick_text(clip[0], ppq, ppb)} for {clip[1] / ppb:g} bar{'' if clip[1] == ppb else 's'}"
+
+def place_pattern(pattern: str, bar: float, track: str = "1"):
+    """
+    Place a clip of a pattern in the playlist with FL's draw tool (mouse: only while the user
+    allows it). pattern: number, or name or its start. bar: 1 = song start, in whole beats
+    (3.25 = bar 3 beat 2 in 4/4). track: playlist track number or name; the spot must be free.
+    Returns FL's "start for length" (bar:step:tick). FL comes to the front; FL windows over the
+    playlist hide for a moment; selects the draw tool.
+    """
+    timing = fl_request("playlist_view")
+    ticks = clip_ticks(bar, timing["ppq"], timing["ppb"])
+    half_step = timing["ppq"] // 8
+    with PlaylistMouse(track, bar, pattern=pattern) as view:
+        y = view.row_middle()
+        # The draw tool starts the clip at the 16th step nearest the click: click where the
+        # hint shows the target time (within half a step), on empty grid
+        x0, spot = round(view.x_of(ticks)), None
+        for x in sorted(range(max(x0 - 4, view.grid[0]), x0 + 5), key=lambda x: abs(x - x0)):
+            shown = hint_ticks(view.checked(x, y), view.ppq, view.ppb)
+            if shown is not None and abs(shown - ticks) < half_step:
+                spot = x
+                break
+        if spot is None:
+            raise FLStudioError(f"Track {view.track} has a clip at {tick_text(ticks, view.ppq, view.ppb)} "
+                                "or the time couldn't be found there; nothing placed.")
+        press_keys(VK_P)
+        time.sleep(0.1)
+        hover(spot, y)
+        click(spot, y)
+        time.sleep(0.2)
+        view.hint(spot, view.grid[1] + 8)  # off the clip, so the hint changes
+        placed = view.clip_at(spot + 2, y)
+        if placed is None or placed[0] != ticks:
+            if placed is not None:
+                move_history(1, undo=True)
+            raise FLStudioError(f"The clip didn't land at {tick_text(ticks, view.ppq, view.ppb)} "
+                                f"({'none placed' if placed is None else 'undone'}).")
+    return with_warnings(clip_text(placed, view.ppq, view.ppb), view.warnings)
+
+def delete_clip(bar: float, track: str):
+    """
+    Delete the playlist clip covering a time on a track (mouse: only while the user allows it):
+    right-click with FL's draw tool. bar: a time inside the clip, as place_pattern. track:
+    number or name. Returns the deleted clip's "start for length".
+    """
+    timing = fl_request("playlist_view")
+    ticks = clip_ticks(bar, timing["ppq"], timing["ppb"])
+    with PlaylistMouse(track, bar) as view:
+        y = view.row_middle()
+        x = view.x_of(ticks + timing["ppq"] // 8)
+        clip = view.clip_at(x, y)
+        if clip is None or not clip[0] <= ticks < clip[0] + clip[1]:
+            raise FLStudioError(f"No clip covers {tick_text(ticks, view.ppq, view.ppb)} on track {view.track}; "
+                                "nothing deleted.")
+        press_keys(VK_P)
+        time.sleep(0.1)
+        hover(x, y)
+        click(x, y, "right")
+        time.sleep(0.2)
+        view.hint(x, view.grid[1] + 8)
+        if view.clip_at(x, y) == clip:
+            raise FLStudioError("The clip is still there after the right-click.")
+    return with_warnings(clip_text(clip, view.ppq, view.ppb), view.warnings)
+
+# No API lists, adds or renames arrangements. The playlist caption's "Current Arrangement"
+# button opens a menu: a header, the arrangements, a header, Clone, Rename, Delete, Merge
+# with, a separator, Add one. Its underlined letters work. It opens with the current
+# arrangement highlighted, so the rows' colors give the count and the current one; the
+# Rename box's title names the current one; FPT_ArrangementJog switches to the next or
+# previous one (wrapping) and FL's hint then names it.
+ARRANGEMENT_BUTTON = "Current Arrangement"
+MENU_ROW = 18  # menu row height at 100% scaling (22 px at 125%)
+VK_A, VK_C, VK_D = 0x41, 0x43, 0x44
+RENAME_TITLE = re.compile(r"Rename (.*) as\.\.\.", re.S)
+ARRANGEMENT_ACTIONS = {"": "list", "l": "list", "a": "add", "c": "clone", "r": "rename", "d": "delete",
+                       "del": "delete", "s": "switch", "go": "switch"}
+arrangement_button_x = None  # where the button was last found
+
+def close_color(a, b):
+    return max(abs(x - y) for x, y in zip(a, b)) <= 12
+
+def color_runs(colors):
+    """[start, end, color] runs of similar colors, from top to bottom"""
+    runs = []
+    for y, color in enumerate(colors):
+        if runs and close_color(runs[-1][2], color):
+            runs[-1][1] = y + 1
+        else:
+            runs.append([y, y + 1, color])
+    return runs
+
+class ArrangementMenu:
+    """FL in front with the playlist showing; the mouse, FL windows over the playlist's
+    caption and any menu or box left open are put back on exit"""
+
+    def __enter__(self):
+        require("mouse", "focus")
+        self.warnings = []
+        self.exits = contextlib.ExitStack()
+        try:
+            self.exits.enter_context(fl_in_front(self.warnings))
+            self.exits.enter_context(cursor_kept())
+            fl_request("playlist_view")  # shows and focuses the playlist
+            form = playlist_layout()[0]
+            self.caption = next(rect for _, cls, _, rect, visible in child_windows(form)
+                                if cls == "TNewCaption" and visible)
+            self.clear = self.exits.enter_context(uncovered(form))
+            self.exits.callback(self.close_popups)
+        except BaseException:
+            self.exits.close()
+            raise
+        return self
+
+    def __exit__(self, *exc):
+        self.exits.close()
+
+    def close_popups(self):
+        for _ in range(3):
+            if not any(fl_top_window(cls) for cls in ("TQuickPopupMenuWindow", "TNameEditForm", "TMsgForm")):
+                return
+            press_keys(VK_ESCAPE)
+            time.sleep(0.2)
+
+    def hint(self, x, y):
+        self.clear(x, y)
+        hover(x, y)
+        return fl_request("hint")["hint"]
+
+    def button(self):
+        """(x, y) of the Current Arrangement button, found by FL's hint along the caption"""
+        global arrangement_button_x
+        left, top, right, bottom = self.caption
+        y = (top + bottom) // 2
+        self.hint(left + 4, y)  # elsewhere first: the hint may still show a message
+        if arrangement_button_x is not None and self.hint(arrangement_button_x, y) == ARRANGEMENT_BUTTON:
+            return arrangement_button_x, y
+        x, seen = left + 4, []  # the button is ~110 px wide at 125%
+        while x < right and self.hint(x, y) != ARRANGEMENT_BUTTON:
+            seen.append(fl_request("hint")["hint"])
+            x += 20
+        if x >= right:
+            raise FLStudioError(f"Couldn't find the playlist's Current Arrangement button (caption {self.caption}, "
+                                f"hints {list(dict.fromkeys(seen))[:12]}).")
+        end = x
+        while end + 20 < right and self.hint(end + 20, y) == ARRANGEMENT_BUTTON:
+            end += 20
+        arrangement_button_x = (x + end) // 2
+        return arrangement_button_x, y
+
+    def open(self):
+        """Open the menu; returns (how many arrangements, the current one, 1-based)"""
+        click(*self.button())
+        popup = wait_for(lambda: fl_top_window("TQuickPopupMenuWindow"), bool, 1.5)
+        if not popup:
+            raise FLStudioError("The Current Arrangement menu didn't open.")
+        time.sleep(0.1)  # drawn
+        left, top, right, bottom = window_rect(popup)
+        scale = window_dpi(popup) / 96
+        runs = [run for run in color_runs(screen_colors(left + round(3 * scale), range(top, bottom)))
+                if run[1] - run[0] >= 10 * scale]
+        # The headers share a color: the arrangements' rows lie between the first two
+        headers = [run for run in runs if close_color(run[2], runs[0][2])]
+        if len(headers) < 2:
+            raise FLStudioError("Couldn't read the Current Arrangement menu (its layout differs).")
+        first, last = top + headers[0][1], top + headers[1][0]
+        count = round((last - first) / (MENU_ROW * scale))
+        if count < 1 or abs(last - first - count * MENU_ROW * scale) > count + 1:
+            raise FLStudioError("Couldn't read the Current Arrangement menu (its rows differ).")
+        row = (last - first) / count
+        # The row below the second header (Clone) isn't highlighted
+        rows = screen_colors(left + round(3 * scale), [first + (i + 0.5) * row for i in range(count)]
+                             + [top + headers[1][1] + row / 2])
+        lit = [i + 1 for i, color in enumerate(rows[:-1]) if not close_color(color, rows[-1])]
+        if len(lit) != 1:
+            raise FLStudioError("Couldn't tell the current arrangement in the menu.")
+        return count, lit[0]
+
+    def box(self, vk, cls):
+        """Press a menu letter and wait for the box it opens"""
+        press_keys(vk)
+        form = wait_for(lambda: fl_top_window(cls), bool, 1.5)
+        if not form:
+            raise FLStudioError("FL's box for that didn't open.")
+        return form
+
+    def enter_name(self, vk, name):
+        self.box(vk, "TNameEditForm")
+        type_text(name)
+        time.sleep(0.1)
+        press_keys(VK_RETURN)
+        if wait_for(lambda: fl_top_window("TNameEditForm"), lambda f: not f, 1.5):
+            raise FLStudioError("FL's name box didn't close.")
+
+    def state(self):
+        """{"current": name, "index": its place in the menu, "count": arrangements}"""
+        count, current = self.open()
+        title = window_title(self.box(VK_R, "TNameEditForm"))
+        self.close_popups()
+        match = RENAME_TITLE.fullmatch(title)
+        if match is None:
+            raise FLStudioError(f"Unexpected rename box title {title!r}.")
+        return {"current": match[1], "index": current, "count": count}
+
+def jog_to(index, state):
+    """Switch from state's current arrangement to the index-th, the shorter way round;
+    returns its name"""
+    ahead = (index - state["index"]) % state["count"]
+    step, steps = (1, ahead) if ahead <= state["count"] / 2 else (-1, state["count"] - ahead)
+    name = state["current"]
+    for _ in range(steps):
+        name = fl_request("arrangement_jog", step=step)
+        if name is None:
+            raise FLStudioError("FL didn't switch arrangements.")
+    return name
+
+def arrangement_names(state):
+    """Every arrangement's name in menu order: one switch through all, back to the current"""
+    names = [None] * state["count"]
+    names[state["index"] - 1] = state["current"]
+    for k in range(1, state["count"] + 1):
+        name = fl_request("arrangement_jog", step=1)
+        i = (state["index"] - 1 + k) % state["count"]
+        if name is None or (names[i] is not None and name != names[i]):
+            raise FLStudioError("FL's arrangements changed while reading them.")
+        names[i] = name
+    return names
+
+def arrangement(action: str = "", name: str = ""):
+    """
+    Playlist arrangements (mouse: only while the user allows it). action: list(l, default),
+    add(a), clone(c) (copies the current one), rename(r) (the current one), delete(d) (the
+    current one), switch(s). name: the new name (add, clone, rename), or the one to switch to
+    (number = place in FL's list, or name). New and cloned ones become current. Returns
+    {"names": [...], "current": number} for list, else {"current": name, "index": number,
+    "count": number}. FL comes to the front and the mouse opens the playlist's menu.
+    """
+    act = ARRANGEMENT_ACTIONS.get(action.lower().strip(), action.lower().strip())
+    if act not in ARRANGEMENT_ACTIONS.values():
+        raise ValueError("action: list(l) add(a) clone(c) rename(r) delete(d) switch(s)")
+    if act in ("add", "clone", "rename", "switch") and not name.strip():
+        raise ValueError(f"{act} needs a name")
+    with ArrangementMenu() as menu:
+        if act in ("list", "switch"):
+            state = menu.state()
+            if act == "list":
+                return with_warnings({"names": arrangement_names(state), "current": state["index"]}, menu.warnings)
+            if name.strip().isdigit():
+                index = int(name)
+                if not 1 <= index <= state["count"]:
+                    raise ValueError(f"There are {state['count']} arrangements.")
+            else:
+                names = arrangement_names(state)
+                found = [i + 1 for i, n in enumerate(names) if n == name] or \
+                        [i + 1 for i, n in enumerate(names) if n.lower().startswith(name.lower())]
+                if len(found) != 1:
+                    raise ValueError(f"{'Several' if found else 'No'} arrangements match {name!r}: {names}")
+                index = found[0]
+            return with_warnings({"current": jog_to(index, state), "index": index, "count": state["count"]},
+                                 menu.warnings)
+        count, _ = menu.open()
+        if act == "delete":
+            if count == 1:
+                raise FLStudioError("It's the only arrangement; nothing deleted.")
+            menu.box(VK_D, "TMsgForm")
+            press_keys(VK_RETURN)  # Ok is the default button
+            if wait_for(lambda: fl_top_window("TMsgForm"), lambda f: not f, 1.5):
+                raise FLStudioError("FL's Confirm box didn't close.")
+        else:
+            menu.enter_name({"add": VK_A, "clone": VK_C, "rename": VK_R}[act], name)
+        time.sleep(0.2)
+        state = menu.state()
+    expected = count - 1 if act == "delete" else count if act == "rename" else count + 1
+    if state["count"] != expected:
+        raise FLStudioError(f"FL has {state['count']} arrangements afterwards, expected {expected}.")
+    if act != "delete" and state["current"] != name:
+        menu.warnings.append(f"FL shows the name as {state['current']!r}")
+    return with_warnings(state, menu.warnings)
+
+def record_automation(param: str, points: list[list], channel: str = "", track: str = "", slot: int | None = None):
+    """
+    Record automation by playing FL with recording on and moving the control in real time
+    (accurate to a few ms; plays sound). It lands where FL records automation: the active
+    pattern's events (pattern mode) or FL's record settings' choice.
+    What: param of a channel's plugin or a mixer track's effect (slot 0-9; "mix" = its mix
+    level), or a mixer track's (no slot) "volume", "pan" or "sep".
+    points: [[beat, value], ...], linear between; value 0-1, or display text for plugin params.
+    Needs "Automation" ticked in FL's record filter (right-click the record button).
+    """
+    if bool(channel) == bool(track):
+        raise ValueError("Give either channel, or track (and slot)")
+    args = {"channel": channel} if channel else {"track": track, "slot": slot}
+    if track and slot is None:
+        param = {"v": "volume", "vol": "volume", "p": "pan"}.get(param.lower(), param.lower())
+    elif param != "mix":
+        points = [[beat, resolve_value(value, param, args)] for beat, value in points]
+    if not points:
+        raise ValueError("Give at least one point")
+    beats = max(p[0] for p in points) - min(p[0] for p in points)
+    seconds = beats * 60 / max(get_tempo(), 10)
+    start = fl_request("automation_start", param=param, points=points, **args)
+    deadline = time.time() + seconds + 10
+    sent, done = 0, False
+    try:
+        while not done and time.time() < deadline:
+            done = fl_request("automation_tick")["done"]
+            sent += 1
+            time.sleep(0.005)
+    finally:
+        if not done:
+            fl_request("stop")
+            fl_request("record", on=False)
+    if not done:
+        raise FLStudioError("Recording didn't reach the last point in time; FL was stopped.")
+    return dict(start, values=sent)
+
+def wait_for(read, done, timeout):
+    """Poll read() until done(value) or timeout; returns the last value. FL can be too busy
+    to answer for a moment (loading a plugin), so request errors are retried until timeout."""
+    deadline = time.time() + timeout
+    while True:
+        try:
+            value = read()
+            if done(value) or time.time() > deadline:
+                return value
+        except FLStudioError:
+            if time.time() > deadline:
+                raise
+        time.sleep(0.2)
+
+# Plugins load the way FL's browser loads them. An instrument's .fst from the plugin
+# database, opened in FL, becomes a new channel. An effect's .fst opened that way always
+# goes to Master, so the browser is walked to it instead (Right opens a folder) and Enter
+# loads it into the selected mixer track's next free slot. The browser's "Plugin database"
+# is the user's folder only; FL's own folder has the .fst of every native plugin.
+PLUGIN_KINDS = {"Generators": "instrument", "Effects": "effect"}
+MIXER_SLOTS = 10
+
+def plugin_database_dirs():
+    """(the user's plugin database, FL's own)"""
+    return (FL_USER_DATA_DIR / "Presets" / "Plugin database",
+            fl_install_dir() / "Data" / "Patches" / "Plugin database")
+
+def find_preset(plugin, kind):
+    """(path parts below Plugin database, file) of a plugin's .fst; kind "Generators" or
+    "Effects". Name exact, else its start, else contained (case-insensitive); the user's
+    folder first, then Installed, then the shortest path."""
+    user_dir, fl_dir = plugin_database_dirs()
+    presets = {}
+    for root in (user_dir, fl_dir):
+        for folder in (root / kind, root / "Installed" / kind):
+            for file in folder.rglob("*.fst"):
+                presets.setdefault(file.relative_to(root).parts, file)
+    names = {}
+    for parts in presets:
+        names.setdefault(parts[-1][:-4].lower(), parts[-1][:-4])
+    query = plugin.strip().lower()
+    matches = ([n for n in names if n == query] or [n for n in names if n.startswith(query)]
+               or [n for n in names if query in n])
+    if len(matches) != 1:
+        what = PLUGIN_KINDS[kind]
+        if matches:
+            raise ValueError(f"{plugin!r} matches several {what}s: {', '.join(sorted(names[m] for m in matches)[:15])}")
+        close = [names[n] for n in difflib.get_close_matches(query, list(names), 5, 0.5)]
+        raise ValueError(f"No {what} {plugin!r} in FL's plugin database" + (f". Close: {', '.join(close)}" if close else ""))
+    parts = min((p for p in presets if p[-1][:-4].lower() == matches[0]),
+                key=lambda p: (not presets[p].is_relative_to(user_dir), p[0] != "Installed", len(p), p))
+    return parts, presets[parts]
+
+def browser(move=0, tab=None):
+    """Move FL's browser selection; [caption, type] of each item passed (or the current one)"""
+    return fl_request("browser", move=move, tab=tab)
+
+def browser_names(parts):
+    """Lower-case names of every folder and .fst below Plugin database/parts, as the browser shows them"""
+    return {item.name.lower() for item in plugin_database_dirs()[0].joinpath(*parts).rglob("*")
+            if item.is_dir() or item.suffix.lower() == ".fst"}
+
+def find_below(name, expected, check_current):
+    """Move down FL's browser to the next item called name. expected: the names that may
+    pass on the way (None: any), so walking out of the folder is caught."""
+    if check_current:
+        caption = browser()["items"][0][0]
+        if caption.lower() == name.lower():
+            return
+    for _ in range(40):
+        items = browser(move=25)["items"]
+        for i, (caption, _) in enumerate(items):
+            if caption.lower() == name.lower():
+                if i < len(items) - 1:
+                    browser(move=i + 1 - len(items))
+                return
+            if expected is not None and caption.lower() not in expected:
+                raise FLStudioError(f"Found {caption!r} in FL Studio's browser while looking for {name!r}.")
+        if items[-1] == items[-2]:
+            break  # the bottom
+    raise FLStudioError(f"Couldn't find {name!r} in FL Studio's browser.")
+
+def browser_keys(*vks):
+    """Press keys in FL's browser, only if it has keyboard focus (elsewhere Ctrl+R exports the song)"""
+    if browser()["focused"] != "Browser":
+        raise FLStudioError("FL Studio's browser didn't get keyboard focus, so no keys were sent.")
+    press_keys(*vks)
+
+
+def walk_browser(path):
+    """Select path (folders, then the file) in FL's browser, in the ALL tab, opening folders
+    with the Right key. Expects FL in front with the browser focused."""
+    browser_keys(VK_CONTROL, VK_UP)  # collapse all folders (this also clears the selection)
+    time.sleep(0.2)
+    browser(tab="right")  # switching tabs selects the tab's first item
+    for _ in range(8):
+        if browser(tab="left")["tab"].upper() == "ALL":
+            break
+    else:
+        raise FLStudioError("Couldn't find the ALL tab in FL Studio's browser.")
+    if not browser()["items"][0][0]:
+        raise FLStudioError("FL Studio's browser has nothing selected to start from.")
+    for _ in range(40):  # to the top, where moving up stops
+        items = browser(move=-100)["items"]
+        if items[-1] == items[-2]:
+            break
+    else:
+        raise FLStudioError("Couldn't reach the top of FL Studio's browser.")
+    for depth, name in enumerate(path):
+        # An open folder's items follow it; pressing Right on one that's already open moves into it
+        find_below(name, browser_names(path[1:depth]) if depth else None, check_current=depth > 0)
+        if depth < len(path) - 1:
+            browser_keys(VK_RIGHT)
+            time.sleep(0.15)
+
+def close_active_effects():
+    """Close the focused mixer effect windows with Esc (FL in front): the browser loads into
+    the active effect's slot, replacing it, and into the next free slot when there's none"""
+    for _ in range(MIXER_SLOTS):
+        effect = fl_request("active_effect", focus=True)
+        if effect["active"] is None:
+            return
+        time.sleep(0.3)
+        if not fl_request("active_effect")["focused"].startswith(effect["name"]):
+            break  # its window didn't get focus: Esc would close something else
+        press_keys(VK_ESCAPE)
+        time.sleep(0.3)
+    raise FLStudioError("Couldn't close the focused effect's window, so the new effect would replace it.")
+
+def assign_free_mixer_track(channel, warnings):
+    """FL's Ctrl+L on one channel; returns its new mixer track, or the one it already has alone
+    (Ctrl+L would move it to another)"""
+    info = fl_request("get_channel", channel=channel, fields=["info"])
+    before = info["mixer_track"]
+    if before and fl_request("get_mixer_track", track=before)["channels"] == [info["name"]]:
+        return before
+    with fl_in_front(warnings):
+        previous = fl_request("select", channel=channel, focus="channel_rack")
+        time.sleep(0.3)
+        press_keys(VK_CONTROL, VK_L)
+        track = wait_for(lambda: get_channel(channel, ["mt"]), lambda t: t != before, 3.0)
+    if previous["channel"] >= 0:
+        fl_request("select", channel=previous["channel"])
+    if track == before:
+        raise FLStudioError(f"Ctrl+L didn't change the channel's mixer track (still {track}).")
+    return track
+
+def add_instrument(plugin: str, link: bool = False):
+    """
+    Add a channel with an instrument from FL's plugin database, as FL's browser does.
+    plugin: name or its start, e.g. "vital". link: also route it to a free mixer track (FL's Ctrl+L).
+    Returns the new channel's name, or {channel, mixer_track} with link. FL may open the plugin's window.
+    """
+    _, preset = find_preset(plugin, "Generators")
+    before = [c["name"] for c in fl_request("get_channel_names")]
+    warnings = []
+    with focus_kept(warnings):
+        open_in_fl(preset)
+        after = wait_for(lambda: [c["name"] for c in fl_request("get_channel_names")],
+                         lambda names: len(names) > len(before), 20.0)
+    if len(after) <= len(before):
+        raise FLStudioError(f"FL Studio didn't add a {preset.stem} channel within 20s.")
+    index = next((i for i, (a, b) in enumerate(zip(after, before)) if a != b), len(before))
+    if not link:
+        return with_warnings(after[index], warnings)
+    track = assign_free_mixer_track(str(index), warnings)
+    return with_warnings({"channel": after[index], "mixer_track": track}, warnings)
+
+def add_effect(plugin: str, track: str):
+    """
+    Add an effect from FL's plugin database to a mixer track's next free slot.
+    plugin: name or its start, e.g. "fruity filter". track: as get_mixer_track.
+    Returns the slot (0-9). FL comes to the front briefly, closes the focused effect's window
+    (else the new one would replace it) and leaves its browser at the plugin.
+    Only effects in your plugin database (FL's favorites) work.
+    """
+    parts, _ = find_preset(plugin, "Effects")
+    if not plugin_database_dirs()[0].joinpath(*parts).exists():
+        # The user's plugin database is also their favorites menu, so nothing is copied into it
+        raise ValueError(f"{parts[-1][:-4]} isn't in your plugin database, the only place FL's browser "
+                         "shows effects: favorite it in FL (plugin menu > Add to plugin database) first.")
+    data = fl_request("get_mixer_track", track=track)
+    index, used = data["index"], {e["slot"] for e in data["effects"]}
+    if len(used) >= MIXER_SLOTS:
+        raise ValueError(f"Mixer track {index} has no free effect slot.")
+    warnings = []
+    previous = fl_request("select", mixer_track=index)
+    try:
+        with fl_in_front(warnings):
+            close_active_effects()
+            fl_request("select", focus="browser")
+            time.sleep(0.2)
+            # Reread the folders first: FL's browser keeps its folder list, and after some
+            # changes (seen after undoing plugin loads) Enter on a file there loads nothing
+            browser_keys(VK_CONTROL, VK_R)
+            time.sleep(1.5)
+            walk_browser(("Plugin database",) + parts)
+            browser_keys(VK_RETURN)
+            data = wait_for(lambda: fl_request("get_mixer_track", track=index),
+                            lambda d: len(d["effects"]) > len(used), 15.0)
+    finally:
+        fl_request("select", mixer_track=previous["mixer_track"])
+    new = [e["slot"] for e in data["effects"] if e["slot"] not in used]
+    if not new:
+        raise FLStudioError(f"FL Studio didn't add {parts[-1][:-4]} within 15s.")
+    return with_warnings(new[0], warnings)
 
 def send_melody(notes_data):
     """(Legacy; prefer add_notes.) Records notes over MIDI: notes_data lines "note,velocity,length,position" (beats; 0.1 resolution; max 127)."""
@@ -610,7 +1487,8 @@ def after_reload():
 TOOLS = [
     list_midi_ports, play, pause, stop, record, change_tempo, get_tempo, get_fl_log,
     get_pattern_names, get_channel_names, get_channel, get_pattern, get_all_patterns, get_notes, add_notes, remove_notes, undo, redo,
-    get_mixer_track, get_plugin_params, send_melody, send_midi_note,
+    set_permissions, get_mixer_track, get_plugin_params, set_plugin_param, change_preset, set_channel, set_mixer_track,
+    set_pattern, set_playlist_track, place_pattern, delete_clip, arrangement, record_automation, add_instrument, add_effect, send_melody, send_midi_note,
 ]
 
 # A tool's description is its docstring, sent whenever the tools load: drop the indentation

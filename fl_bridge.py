@@ -4,11 +4,13 @@ MIDI link between the MCP server and the FL Studio controller script.
 Reloaded by the reload_server tool, so anything that must survive a reload
 (open MIDI ports, queues, the script log) is only created on first import.
 """
+import contextlib
 import ctypes
 import itertools
 import json
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
@@ -141,6 +143,38 @@ def send_sysex(msg_type, obj):
 class FLStudioError(Exception):
     pass
 
+# --- What the user allows ------------------------------------------------------
+# The user switches these in chat (set_permissions): taking focus (bringing FL to
+# the front for a moment, for shortcut keys) is allowed unless they switch it off;
+# the mouse only while they've switched it on. Saved next to this file, so restarts
+# and reloads keep them; every focus or mouse action checks them first.
+PERMISSIONS_FILE = Path(__file__).with_name("permissions.json")
+PERMISSION_DEFAULTS = {"focus": True, "mouse": False}
+PERMISSION_ERRORS = {
+    "focus": "Taking focus is switched off (the user asked), so FL Studio can't come to the front. "
+             "Ask the user to switch it back on.",
+    "mouse": "Mouse use is switched off. Only the user can switch it on.",
+}
+
+def permissions():
+    try:
+        saved = json.loads(PERMISSIONS_FILE.read_text())
+    except (OSError, ValueError):
+        saved = {}
+    return {name: bool(saved.get(name, default)) for name, default in PERMISSION_DEFAULTS.items()}
+
+def save_permissions(**changes):
+    current = dict(permissions(), **{k: bool(v) for k, v in changes.items() if v is not None})
+    PERMISSIONS_FILE.write_text(json.dumps(current))
+    return current
+
+def require(*names):
+    """Raise unless the user allows each of names ("focus", "mouse")"""
+    allowed = permissions()
+    for name in names:
+        if not allowed[name]:
+            raise FLStudioError(PERMISSION_ERRORS[name])
+
 def fl_request(cmd, timeout=10.0, **args):
     """Run a command in the FL Studio script and return its result"""
     if not ensure_listener():
@@ -172,8 +206,9 @@ EXPORT_REQUEST_FILE = PIANO_ROLL_SCRIPTS_DIR / "export_request.json"
 EXPORT_STATE_FILE = PIANO_ROLL_SCRIPTS_DIR / "piano_roll_state.json"
 FL_PROCESS_NAME = "fl64.exe"
 
-VK_CONTROL, VK_MENU, VK_Y = 0x11, 0x12, 0x59
-KEYEVENTF_KEYUP = 0x0002
+VK_CONTROL, VK_MENU, VK_Y, VK_L = 0x11, 0x12, 0x59, 0x4C
+VK_RETURN, VK_RIGHT, VK_UP, VK_ESCAPE, VK_R = 0x0D, 0x27, 0x26, 0x1B, 0x52
+KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x0001, 0x0002
 SW_RESTORE = 9
 SW_SHOWMINNOACTIVE = 7  # minimize without taking focus
 GW_HWNDPREV = 3  # the window just above, in the stacking order
@@ -206,6 +241,23 @@ user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctyp
 user32.GetWindowLongW.argtypes = [wintypes.HWND, ctypes.c_int]
 user32.GetWindowLongW.restype = ctypes.c_long
 user32.keybd_event.argtypes = [wintypes.BYTE, wintypes.BYTE, wintypes.DWORD, ctypes.c_size_t]
+user32.mouse_event.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, wintypes.DWORD, ctypes.c_size_t]
+user32.SetCursorPos.argtypes = [ctypes.c_int, ctypes.c_int]
+user32.GetCursorPos.argtypes = [ctypes.POINTER(wintypes.POINT)]
+user32.WindowFromPoint.argtypes = [wintypes.POINT]
+user32.WindowFromPoint.restype = wintypes.HWND
+user32.GetParent.argtypes = [wintypes.HWND]
+user32.GetParent.restype = wintypes.HWND
+user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+user32.GetAncestor.restype = wintypes.HWND
+user32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.GetClassNameW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+user32.EnumChildWindows.argtypes = [wintypes.HWND, WNDENUMPROC, wintypes.LPARAM]
+try:
+    # Real pixels for window rectangles and the cursor on scaled displays (per-monitor v2)
+    user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+except (AttributeError, OSError):
+    pass
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
@@ -288,70 +340,75 @@ def visible_window_above(hwnd):
         above = user32.GetWindow(above, GW_HWNDPREV)
     return None
 
-def press_ctrl_alt_y():
-    for vk in (VK_CONTROL, VK_MENU, VK_Y):
-        user32.keybd_event(vk, 0, 0, 0)
-    for vk in (VK_Y, VK_MENU, VK_CONTROL):
-        user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
+def press_keys(*vks):
+    """Press keys together (modifiers first), then release them in reverse order. Page
+    Up..Delete (arrows, Home, End, Insert) go as extended keys: otherwise Windows takes them
+    for numpad keys and drops a held Shift (Shift+Down then scrolls instead of moving)."""
+    flags = lambda vk: KEYEVENTF_EXTENDEDKEY if 0x21 <= vk <= 0x2E else 0
+    for vk in vks:
+        user32.keybd_event(vk, 0, flags(vk), 0)
+    for vk in reversed(vks):
+        user32.keybd_event(vk, 0, flags(vk) | KEYEVENTF_KEYUP, 0)
 
-def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None, request=None):
-    """Trigger ExportNotes in FL Studio's focused piano roll and return its output.
-    before_shortcut runs once FL Studio is on screen, right before Ctrl+Alt+Y.
-    Problems putting the windows back are appended to window_warnings.
-    request adds fields to export_request.json, e.g. {"add_notes": [...]}."""
-    if window_warnings is None:
-        window_warnings = []
+class KEYBDINPUT(ctypes.Structure):
+    _fields_ = [("wVk", wintypes.WORD), ("wScan", wintypes.WORD), ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD), ("dwExtraInfo", ctypes.c_size_t)]
+
+class INPUT(ctypes.Structure):
+    class _U(ctypes.Union):
+        # Sized for the largest member (MOUSEINPUT), as SendInput expects
+        _fields_ = [("ki", KEYBDINPUT), ("pad", ctypes.c_byte * 32)]
+    _anonymous_ = ("u",)
+    _fields_ = [("type", wintypes.DWORD), ("u", _U)]
+
+user32.SendInput.argtypes = [wintypes.UINT, ctypes.POINTER(INPUT), ctypes.c_int]
+KEYEVENTF_UNICODE = 0x0004
+
+def type_text(text):
+    """Type text into the focused control as Unicode characters (any language, symbols).
+    FL's name boxes dropped a Unicode space, so spaces go as the Space key."""
+    for char in text:
+        if char == " ":
+            press_keys(0x20)
+            time.sleep(0.01)
+            continue
+        for flags in (KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP):
+            event = INPUT(type=1)  # INPUT_KEYBOARD
+            event.ki = KEYBDINPUT(0, ord(char), flags, 0, 0)
+            user32.SendInput(1, ctypes.byref(event), ctypes.sizeof(INPUT))
+        time.sleep(0.01)
+
+def press_ctrl_alt_y():
+    press_keys(VK_CONTROL, VK_MENU, VK_Y)
+
+def fl_main_window():
+    """(FL's main window, handles of all its windows). FL's main window is titled
+    "... FL Studio 20xx"; FL also has untitled helper windows. Detached editors like the
+    piano roll are windows owned by it: they move with it in the stacking order, FL routes
+    shortcuts to whichever of them it has focused, and the piano roll window is recreated
+    when it's reopened, so its handle can't be kept."""
     windows = fl_windows()
     if not windows:
         raise FLStudioError("Couldn't find FL Studio's window. Is FL Studio running?")
-    # Always work with FL's main window (titled "... FL Studio 20xx"; FL also has
-    # untitled helper windows). Detached editors like the piano roll are windows
-    # owned by it: they move with it in the stacking order, FL routes the shortcut
-    # to whichever of them it has focused, and the piano roll window is recreated
-    # when it's reopened, so its handle can't be kept.
     unowned = [(hwnd, title) for hwnd, title in windows if not user32.GetWindow(hwnd, GW_OWNER)]
-    target = (next((hwnd for hwnd, title in unowned if "fl studio" in title.lower()), None)
-              or (unowned or windows)[0][0])
-    request_id = f"{time.time():.6f}"
-    EXPORT_REQUEST_FILE.write_text(json.dumps({**(request or {}), "id": request_id}))
-    previous = user32.GetForegroundWindow()  # whatever window the user is in, any app
+    main = (next((hwnd for hwnd, title in unowned if "fl studio" in title.lower()), None)
+            or (unowned or windows)[0][0])
+    return main, {hwnd for hwnd, _ in windows}
+
+@contextlib.contextmanager
+def focus_kept(window_warnings):
+    """Afterwards, if FL Studio is in front, hand focus back to the window the user was in
+    (any app) and slot FL back under the window that was just above it, so every window
+    ends up in the same stacking order as before; minimize FL again if it was. Problems
+    are appended to window_warnings. Yields (FL's main window, its window handles)."""
+    target, fl_handles = fl_main_window()
+    previous = user32.GetForegroundWindow()
     was_minimized = bool(user32.IsIconic(target))
-    above_fl = visible_window_above(target)  # to put FL back at the same depth afterwards
+    above_fl = visible_window_above(target)
     try:
-        fl_handles = {hwnd for hwnd, _ in windows}
-        if not focus_window(target, accept=fl_handles):
-            raise FLStudioError("Windows didn't let FL Studio come to the front, so the shortcut wasn't sent.")
-        # Un-minimizing animates; wait until FL is really restored and in front
-        ready_by = time.time() + 2.0
-        while (user32.IsIconic(target) or user32.GetForegroundWindow() not in fl_handles) and time.time() < ready_by:
-            time.sleep(0.05)
-        time.sleep(0.5 if was_minimized else 0.15)
-        if before_shortcut:
-            before_shortcut()
-            time.sleep(0.1)
-        deadline = time.time() + timeout
-        retry_at = time.time() + 1.5  # press once more if the first press was missed
-        press_ctrl_alt_y()
-        while time.time() < deadline:
-            try:
-                state = json.loads(EXPORT_STATE_FILE.read_text())
-            except (OSError, ValueError):  # not written yet, or caught mid-write
-                state = None
-            if state and state.get("request_id") == request_id:
-                return state
-            if retry_at and time.time() > retry_at:
-                retry_at = None
-                press_ctrl_alt_y()
-            time.sleep(0.05)
-        raise FLStudioError("ExportNotes didn't respond to Ctrl+Alt+Y within "
-                            f"{timeout}s. Run it once from the piano roll (Tools > Scripting > "
-                            "ExportNotes) so it becomes the 'last script', then try again.")
+        yield target, fl_handles
     finally:
-        # Remove the request so running ExportNotes by hand later can't apply it again
-        EXPORT_REQUEST_FILE.unlink(missing_ok=True)
-        # Hand focus back, unless the user already switched to another window meanwhile,
-        # and slot FL back under the window that was just above it, so every window
-        # ends up in the same stacking order as before
+        # Unless the user already switched to another window meanwhile
         if previous and user32.GetForegroundWindow() in {hwnd for hwnd, _ in fl_windows()}:
             focus_window(previous)
             if above_fl and visible_window_above(target) != above_fl:
@@ -362,6 +419,185 @@ def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None, re
                                            f"(Windows error {error})")
             if was_minimized:
                 user32.ShowWindow(target, SW_SHOWMINNOACTIVE)
+
+@contextlib.contextmanager
+def fl_in_front(window_warnings):
+    """Bring FL Studio's main window to the front so keys reach it; afterwards as focus_kept"""
+    require("focus")
+    with focus_kept(window_warnings) as (target, fl_handles):
+        was_minimized = bool(user32.IsIconic(target))
+        if not focus_window(target, accept=fl_handles):
+            raise FLStudioError("Windows didn't let FL Studio come to the front, so no keys were sent.")
+        # Un-minimizing animates; wait until FL is really restored and in front
+        ready_by = time.time() + 2.0
+        while (user32.IsIconic(target) or user32.GetForegroundWindow() not in fl_handles) and time.time() < ready_by:
+            time.sleep(0.05)
+        time.sleep(0.5 if was_minimized else 0.15)
+        yield target
+
+def open_in_fl(path):
+    """Hand a file to the running FL Studio, as if opened from Explorer (a second FL64.exe
+    passes it on to the running one). FL may come to the front, so it needs focus allowed."""
+    require("focus")
+    main, _ = fl_main_window()
+    subprocess.Popen([window_process(main)[1], str(path)])
+
+# --- Mouse (only while the user allows it) --------------------------------------
+# FL's forms are real child windows, so their rectangles anchor click positions, and
+# WindowFromPoint tells what a click would hit. FL keeps floating forms (piano roll,
+# plugin windows) above docked ones whatever the stacking order says, so forms in the
+# way are hidden for the moment and shown again afterwards.
+MOUSEEVENTF_MOVE, MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP = 0x0001, 0x0002, 0x0004
+MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP = 0x0008, 0x0010
+GA_ROOT = 2
+SW_HIDE, SW_SHOWNA = 0, 8
+
+def class_name(hwnd):
+    buffer = ctypes.create_unicode_buffer(64)
+    user32.GetClassNameW(hwnd, buffer, 64)
+    return buffer.value
+
+def window_rect(hwnd):
+    r = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(r))
+    return r.left, r.top, r.right, r.bottom
+
+def child_windows(parent):
+    """All descendants of parent: [(hwnd, class, title, rect, visible)]"""
+    found = []
+    def collect(hwnd, _):
+        found.append((hwnd, class_name(hwnd), window_title(hwnd), window_rect(hwnd), bool(user32.IsWindowVisible(hwnd))))
+        return True
+    user32.EnumChildWindows(parent, WNDENUMPROC(collect), 0)
+    return found
+
+def form_under(x, y, main):
+    """The FL form a click at (x, y) would hit: the child of main holding the window there,
+    a detached FL window, or None for another app's window"""
+    hwnd = user32.WindowFromPoint(wintypes.POINT(x, y))
+    root = user32.GetAncestor(hwnd, GA_ROOT) if hwnd else None
+    if root != main:
+        return root if root in {h for h, _ in fl_windows()} else None
+    while user32.GetParent(hwnd) and user32.GetParent(hwnd) != main:
+        hwnd = user32.GetParent(hwnd)
+    return hwnd
+
+@contextlib.contextmanager
+def uncovered(target_form):
+    """Yields clear(x, y): hides the FL forms covering target_form at (x, y). They're shown
+    again on exit."""
+    main = fl_main_window()[0]
+    top = target_form
+    while user32.GetParent(top) and user32.GetParent(top) != main:
+        top = user32.GetParent(top)
+    hidden = []
+
+    def clear(x, y):
+        for _ in range(10):
+            form = form_under(int(x), int(y), main)
+            if form == top:
+                return
+            if form is None:
+                raise FLStudioError(f"Another app's window covers FL Studio at ({x:.0f}, {y:.0f}).")
+            user32.ShowWindow(form, SW_HIDE)
+            hidden.append(form)
+            time.sleep(0.05)
+        raise FLStudioError(f"Couldn't uncover FL Studio's {window_title(target_form)!r} at ({x:.0f}, {y:.0f}).")
+    try:
+        yield clear
+    finally:
+        for form in reversed(hidden):
+            user32.ShowWindow(form, SW_SHOWNA)
+
+@contextlib.contextmanager
+def cursor_kept():
+    """Put the mouse cursor back where it was"""
+    point = wintypes.POINT()
+    user32.GetCursorPos(ctypes.byref(point))
+    try:
+        yield
+    finally:
+        user32.SetCursorPos(point.x, point.y)
+
+def hover(x, y):
+    """Move the mouse to (x, y) with a real move event, so FL updates its hint for that spot"""
+    require("mouse", "focus")
+    user32.SetCursorPos(int(x), int(y))
+    user32.mouse_event(MOUSEEVENTF_MOVE, 1, 0, 0, 0)
+    user32.mouse_event(MOUSEEVENTF_MOVE, 0xFFFFFFFF, 0, 0, 0)  # -1: back to (x, y)
+    time.sleep(0.05)
+
+def fl_top_window(cls):
+    """FL's visible top-level window of a class (a popup menu, a dialog) that has a size, or None"""
+    for hwnd, _ in fl_windows():
+        left, top, right, bottom = window_rect(hwnd)
+        if class_name(hwnd) == cls and right > left and bottom > top:
+            return hwnd
+    return None
+
+gdi32 = ctypes.WinDLL("gdi32")
+user32.GetDC.restype, user32.GetDC.argtypes = wintypes.HDC, [wintypes.HWND]
+user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
+gdi32.GetPixel.restype, gdi32.GetPixel.argtypes = wintypes.DWORD, [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+
+def screen_colors(x, ys):
+    """(r, g, b) showing on screen at x for each y, popup menus included"""
+    dc = user32.GetDC(None)
+    try:
+        return [(c & 0xFF, c >> 8 & 0xFF, c >> 16 & 0xFF) for c in (gdi32.GetPixel(dc, int(x), int(y)) for y in ys)]
+    finally:
+        user32.ReleaseDC(None, dc)
+
+def window_dpi(hwnd):
+    return user32.GetDpiForWindow(hwnd) or 96
+
+def click(x, y, button="left"):
+    require("mouse", "focus")
+    down, up = ((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) if button == "left"
+                else (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP))
+    user32.SetCursorPos(int(x), int(y))
+    user32.mouse_event(down, 0, 0, 0, 0)
+    time.sleep(0.03)
+    user32.mouse_event(up, 0, 0, 0, 0)
+    time.sleep(0.1)
+
+def fl_install_dir():
+    return Path(window_process(fl_main_window()[0])[1]).parent
+
+def run_export_notes(timeout=5.0, before_shortcut=None, window_warnings=None, request=None):
+    """Trigger ExportNotes in FL Studio's focused piano roll and return its output.
+    before_shortcut runs once FL Studio is on screen, right before Ctrl+Alt+Y.
+    Problems putting the windows back are appended to window_warnings.
+    request adds fields to export_request.json, e.g. {"add_notes": [...]}."""
+    if window_warnings is None:
+        window_warnings = []
+    request_id = f"{time.time():.6f}"
+    EXPORT_REQUEST_FILE.write_text(json.dumps({**(request or {}), "id": request_id}))
+    try:
+        with fl_in_front(window_warnings):
+            if before_shortcut:
+                before_shortcut()
+                time.sleep(0.1)
+            deadline = time.time() + timeout
+            retry_at = time.time() + 1.5  # press once more if the first press was missed
+            press_ctrl_alt_y()
+            while time.time() < deadline:
+                try:
+                    state = json.loads(EXPORT_STATE_FILE.read_text())
+                except (OSError, ValueError):  # not written yet, or caught mid-write
+                    state = None
+                if state and state.get("request_id") == request_id:
+                    return state
+                if retry_at and time.time() > retry_at:
+                    retry_at = None
+                    press_ctrl_alt_y()
+                time.sleep(0.05)
+            raise FLStudioError("ExportNotes didn't respond to Ctrl+Alt+Y within "
+                                f"{timeout}s. Run it once from the piano roll (Tools > Scripting > "
+                                "ExportNotes) so it becomes the 'last script', then try again.")
+    finally:
+        # Remove the request so running ExportNotes by hand later can't apply it again
+        EXPORT_REQUEST_FILE.unlink(missing_ok=True)
 
 # Open the ports on first import: the output fails loudly if loopMIDI isn't
 # running, the input is opened now so script output is captured from the start
