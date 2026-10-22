@@ -633,6 +633,11 @@ def req_undo_state():
     hint is FL's "position/length" text"""
     return {"position": general.getUndoHistoryLast(), "hint": general.getUndoLevelHint()}
 
+def req_save_undo(name):
+    """Add a named point to FL's undo history (undoing it shows "Undone: name")"""
+    general.saveUndo(name, midi.UF_PL)
+    return req_undo_state()
+
 def req_undo_move(delta):
     """Move through the undo history: negative undoes, positive redoes (per the API
     docs; the server checks the direction, since FL 21 swapped related functions)"""
@@ -782,6 +787,49 @@ def req_song_state():
              "performance_mode": playlist.getPerformanceModeState()}
     return state
 
+def req_time_selection(start=None, end=None):
+    """Sets the playlist's time selection in beats (none given: clears it); returns it"""
+    import arrangement
+    ppq = general.getRecPPQ()
+    if start is None:
+        arrangement.selectionClear()
+    else:
+        arrangement.selectionSet(round(start * ppq), round(end * ppq))
+    return [arrangement.selectionStart() / ppq, arrangement.selectionEnd() / ppq]
+
+def req_tweak(param, value, channel=None, track=None, slot=None):
+    """Set a control through the API, which makes it FL's last tweaked one (Tools > Last
+    tweaked): a plugin parameter, a mixer effect's "mix" level, or (track without slot) a mixer
+    track's volume, pan or sep; value 0-1 (pan/sep: 0.5 = center). Returns the value it had,
+    the value it has (a stepped parameter rounds) and the parameter's name (plugins only)."""
+    name = None
+    if track is not None and slot is None:
+        t = find_mixer_track(track)
+        controls = {
+            "volume": (lambda: mixer.getTrackVolume(t), lambda v: mixer.setTrackVolume(t, v, midi.PIM_None)),
+            "pan": (lambda: (mixer.getTrackPan(t) + 1) / 2, lambda v: mixer.setTrackPan(t, v * 2 - 1, midi.PIM_None)),
+            "sep": (lambda: (mixer.getTrackStereoSep(t) + 1) / 2,
+                    lambda v: mixer.setTrackStereoSep(t, v * 2 - 1, midi.PIM_None))}
+        if param not in controls:
+            raise ValueError(f"Without a slot, param is one of {list(controls)}")
+        get, put = controls[param]
+    elif channel is None and param == "mix":
+        t = find_mixer_track(track)
+        s = effect_slot(t, slot)
+        get, put = lambda: mixer.getPluginMixLevel(t, s), lambda v: mixer.setPluginMixLevel(t, s, v, midi.PIM_None)
+    else:
+        plugin = plugin_target(channel, track, slot)
+        p = find_param(param, plugin)
+        name = plugins.getParamName(p, *plugin)
+        get = lambda: plugins.getParamValue(p, *plugin)
+        put = lambda v: plugins.setParamValue(v, p, plugin[0], plugin[1], midi.PIM_None, plugin[2])
+    before = get()
+    value = min(max(float(value), 0.0), 1.0)
+    # A set that changes nothing may not count as a tweak: move it a little first
+    put(value + 0.01 if value < 0.5 else value - 0.01)
+    put(value)
+    return {"before": finite(before, 6), "after": finite(get(), 6), "name": name}
+
 # --- Playlist (mouse) -----------------------------------------------------------
 # No API places clips or edits arrangements, so the server uses the mouse (only while
 # the user allows it): these prepare the playlist and read FL's hint bar, which names
@@ -831,6 +879,8 @@ REQUEST_HANDLERS = {
     "arrangement_jog": req_arrangement_jog,
     "api_names": req_api_names,
     "song_state": req_song_state,
+    "time_selection": req_time_selection,
+    "tweak": req_tweak,
     "keybinds": req_keybinds,
     "run_keybind": req_run_keybind,
     "transport_state": req_transport_state,
@@ -840,6 +890,7 @@ REQUEST_HANDLERS = {
     "record": req_record,
     "undo_state": req_undo_state,
     "undo_move": req_undo_move,
+    "save_undo": req_save_undo,
     "ping": lambda: "pong",
     "get_mixer_track": req_get_mixer_track,
     "select": req_select,

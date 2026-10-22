@@ -208,6 +208,7 @@ FL_PROCESS_NAME = "fl64.exe"
 
 VK_CONTROL, VK_MENU, VK_Y, VK_L = 0x11, 0x12, 0x59, 0x4C
 VK_RETURN, VK_RIGHT, VK_UP, VK_ESCAPE, VK_R = 0x0D, 0x27, 0x26, 0x1B, 0x52
+VK_SHIFT, VK_DOWN, VK_HOME, VK_END = 0x10, 0x28, 0x24, 0x23
 KEYEVENTF_EXTENDEDKEY, KEYEVENTF_KEYUP = 0x0001, 0x0002
 SW_RESTORE = 9
 SW_SHOWMINNOACTIVE = 7  # minimize without taking focus
@@ -527,38 +528,93 @@ def hover(x, y):
     user32.mouse_event(MOUSEEVENTF_MOVE, 0xFFFFFFFF, 0, 0, 0)  # -1: back to (x, y)
     time.sleep(0.05)
 
-def fl_top_window(cls):
-    """FL's visible top-level window of a class (a popup menu, a dialog) that has a size, or None"""
+def fl_top_windows(cls):
+    """FL's visible top-level windows of a class (popup menus, dialogs) that have a size"""
+    found = []
     for hwnd, _ in fl_windows():
         left, top, right, bottom = window_rect(hwnd)
         if class_name(hwnd) == cls and right > left and bottom > top:
-            return hwnd
-    return None
+            found.append(hwnd)
+    return found
+
+def foreground_class():
+    """Class name of the window that has the keyboard focus's top-level window"""
+    return class_name(user32.GetForegroundWindow())
+
+def fl_top_window(cls):
+    """FL's visible top-level window of a class (a popup menu, a dialog) that has a size, or None"""
+    return next(iter(fl_top_windows(cls)), None)
+
+class BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [("biSize", wintypes.DWORD), ("biWidth", ctypes.c_long), ("biHeight", ctypes.c_long),
+                ("biPlanes", wintypes.WORD), ("biBitCount", wintypes.WORD), ("biCompression", wintypes.DWORD),
+                ("biSizeImage", wintypes.DWORD), ("biXPelsPerMeter", ctypes.c_long),
+                ("biYPelsPerMeter", ctypes.c_long), ("biClrUsed", wintypes.DWORD), ("biClrImportant", wintypes.DWORD)]
 
 gdi32 = ctypes.WinDLL("gdi32")
 user32.GetDC.restype, user32.GetDC.argtypes = wintypes.HDC, [wintypes.HWND]
 user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
-gdi32.GetPixel.restype, gdi32.GetPixel.argtypes = wintypes.DWORD, [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.CreateCompatibleDC.restype, gdi32.CreateCompatibleDC.argtypes = wintypes.HDC, [wintypes.HDC]
+gdi32.CreateCompatibleBitmap.restype = wintypes.HBITMAP
+gdi32.CreateCompatibleBitmap.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int]
+gdi32.SelectObject.restype, gdi32.SelectObject.argtypes = wintypes.HGDIOBJ, [wintypes.HDC, wintypes.HGDIOBJ]
+gdi32.BitBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.HDC,
+                         ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+gdi32.GetDIBits.argtypes = [wintypes.HDC, wintypes.HBITMAP, wintypes.UINT, wintypes.UINT, ctypes.c_void_p,
+                            ctypes.POINTER(BITMAPINFOHEADER), wintypes.UINT]
+gdi32.DeleteObject.argtypes = [wintypes.HGDIOBJ]
+gdi32.DeleteDC.argtypes = [wintypes.HDC]
+SRCCOPY, CAPTUREBLT = 0x00CC0020, 0x40000000
+
+def screen_grab(left, top, right, bottom):
+    """What shows on screen in a rectangle, popup menus included, copied at once (reading
+    pixels one by one takes ~6 ms each): a function (x, y) -> (r, g, b) in screen coordinates"""
+    left, top, width, height = int(left), int(top), int(right - left), int(bottom - top)
+    screen = user32.GetDC(None)
+    dc = gdi32.CreateCompatibleDC(screen)
+    bitmap = gdi32.CreateCompatibleBitmap(screen, width, height)
+    data = (ctypes.c_ubyte * (width * height * 4))()
+    try:
+        old = gdi32.SelectObject(dc, bitmap)
+        gdi32.BitBlt(dc, 0, 0, width, height, screen, left, top, SRCCOPY | CAPTUREBLT)
+        gdi32.SelectObject(dc, old)
+        header = BITMAPINFOHEADER(ctypes.sizeof(BITMAPINFOHEADER), width, -height, 1, 32)  # top-down
+        gdi32.GetDIBits(dc, bitmap, 0, height, data, ctypes.byref(header), 0)
+    finally:
+        gdi32.DeleteObject(bitmap)
+        gdi32.DeleteDC(dc)
+        user32.ReleaseDC(None, screen)
+    raw = bytes(data)
+
+    def color(x, y):
+        i = ((int(y) - top) * width + int(x) - left) * 4  # BGRA
+        return raw[i + 2], raw[i + 1], raw[i]
+    return color
 
 def screen_colors(x, ys):
     """(r, g, b) showing on screen at x for each y, popup menus included"""
-    dc = user32.GetDC(None)
-    try:
-        return [(c & 0xFF, c >> 8 & 0xFF, c >> 16 & 0xFF) for c in (gdi32.GetPixel(dc, int(x), int(y)) for y in ys)]
-    finally:
-        user32.ReleaseDC(None, dc)
+    ys = [int(y) for y in ys]
+    color = screen_grab(x, min(ys), x + 1, max(ys) + 1)
+    return [color(x, y) for y in ys]
 
 def window_dpi(hwnd):
     return user32.GetDpiForWindow(hwnd) or 96
 
-def click(x, y, button="left"):
+def click(x, y, button="left", held=()):
+    """Click at (x, y), holding the keys in held (e.g. (VK_SHIFT,)) during it"""
     require("mouse", "focus")
     down, up = ((MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP) if button == "left"
                 else (MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP))
     user32.SetCursorPos(int(x), int(y))
-    user32.mouse_event(down, 0, 0, 0, 0)
-    time.sleep(0.03)
-    user32.mouse_event(up, 0, 0, 0, 0)
+    for vk in held:
+        user32.keybd_event(vk, 0, 0, 0)
+    try:
+        user32.mouse_event(down, 0, 0, 0, 0)
+        time.sleep(0.03)
+        user32.mouse_event(up, 0, 0, 0, 0)
+    finally:
+        for vk in reversed(held):
+            user32.keybd_event(vk, 0, KEYEVENTF_KEYUP, 0)
     time.sleep(0.1)
 
 def fl_install_dir():

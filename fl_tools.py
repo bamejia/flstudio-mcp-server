@@ -2,6 +2,7 @@
 The flstudio MCP server's tools. Every function in TOOLS is registered by
 trigger.py and re-registered when the reload_server tool reloads this module.
 """
+import collections
 import contextlib
 import difflib
 import inspect
@@ -14,10 +15,11 @@ import mido
 from mido import Message
 
 from fl_bridge import (CC_TEMPO_LSB, CC_TEMPO_MSB, CC_TEMPO_REPLY_LSB, CC_TEMPO_REPLY_MSB,
-                       CC_TEMPO_REQUEST, FL_USER_DATA_DIR, INPUT_PORT_NAME, VK_CONTROL, VK_ESCAPE, VK_L,
-                       VK_R, VK_RETURN, VK_RIGHT, VK_UP, FLStudioError, ensure_listener, fl_in_front, fl_install_dir,
-                       child_windows, click, cursor_kept, fl_log, fl_main_window, fl_request, focus_kept, hover,
-                       fl_top_window, open_in_fl, press_keys, require, run_export_notes, save_permissions,
+                       CC_TEMPO_REQUEST, FL_USER_DATA_DIR, INPUT_PORT_NAME, VK_CONTROL, VK_DOWN, VK_END,
+                       VK_ESCAPE, VK_HOME, VK_L, VK_R, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP, FLStudioError,
+                       ensure_listener, fl_in_front, fl_install_dir, child_windows, click, cursor_kept, fl_log,
+                       fl_main_window, fl_request, focus_kept, foreground_class, hover, fl_top_window,
+                       fl_top_windows, open_in_fl, press_keys, require, run_export_notes, save_permissions,
                        screen_colors, send, tempo_replies, type_text, uncovered, window_dpi, window_rect,
                        window_title)
 
@@ -783,12 +785,13 @@ class PlaylistMouse:
             # The target bar a bar in from the left edge, the target track at the top
             view = fl_request("playlist_view", bar=max(1, int(self.bar) - 1), track=self.track, pattern=self.pattern)
             self.exits.callback(fl_request, "playlist_view", bar=view["vis_bar"], pattern=view["pattern"])
-            default = self.name == f"Track {self.track}"
             fl_request("set_playlist_track", track=self.track, name=ROW_TOKEN)
-            self.exits.callback(fl_request, "set_playlist_track", track=self.track, name="" if default else self.name)
+            self.exits.callback(self.restore_name)
             self.ppq, self.ppb = view["ppq"], view["ppb"]
             self.form, self.grid, self.names_x = playlist_layout()
             self.clear = self.exits.enter_context(uncovered(self.form))
+            # A hint left from before (this track's name, say) would fool row(): show a fresh one
+            self.hint(self.grid[0] + 4, self.grid[1] + 8)
         except BaseException:
             self.exits.close()
             raise
@@ -797,10 +800,25 @@ class PlaylistMouse:
     def __exit__(self, *exc):
         self.exits.close()
 
+    def restore_name(self):
+        """The target track's own name again (rows can't be found by name after this)"""
+        default = self.name == f"Track {self.track}"
+        fl_request("set_playlist_track", track=self.track, name="" if default else self.name)
+
     def hint(self, x, y):
         self.clear(x, y)
         hover(x, y)
         return fl_request("hint")["hint"].strip()
+
+    def stable_hint(self, x, y):
+        """FL's hint at (x, y) once two reads agree (it can lag a mouse move)"""
+        text = self.hint(x, y)
+        for _ in range(4):
+            again = fl_request("hint")["hint"].strip()
+            if again == text:
+                break
+            text = again
+        return text
 
     def x_of(self, ticks):
         """The x of a time in the grid, from two times read on the ruler (once)"""
@@ -815,7 +833,17 @@ class PlaylistMouse:
         return x0 + (ticks - t0) * per_tick
 
     def row(self):
-        """(top, bottom) y of the target track's row: scan the track names column, then bisect"""
+        """(top, bottom) y of the target track's row: scan the track names column for the
+        token, then bisect. The track gets its name back at once: FL's undo entries for clip
+        changes keep the track names they saw, so undoing one later would bring the token back."""
+        if not hasattr(self, "row_y"):
+            try:
+                self.row_y = self.find_row()
+            finally:
+                self.restore_name()
+        return self.row_y
+
+    def find_row(self):
         _, top, _, bottom = self.grid
         is_target = lambda y: self.hint(self.names_x, y) == ROW_TOKEN
         y = top
@@ -833,7 +861,10 @@ class PlaylistMouse:
         below = y + 16
         while below < bottom and is_target(below):
             below += 16
-        return row_top, edge(below - 16, min(below, bottom))
+        row_bottom = edge(below - 16, min(below, bottom))
+        if row_bottom - row_top < 10:
+            raise FLStudioError(f"Couldn't measure playlist track {self.track}'s row ({row_top}-{row_bottom}).")
+        return row_top, row_bottom
 
     def row_middle(self):
         row_top, row_bottom = self.row()
@@ -843,9 +874,9 @@ class PlaylistMouse:
         """FL's hint at (x, y), after checking the spot is in the target track's row"""
         if not self.grid[0] <= x < self.grid[2]:
             raise FLStudioError("That time isn't visible in the playlist; nothing clicked.")
-        if self.hint(self.names_x, y) != ROW_TOKEN:
+        if self.hint(self.names_x, y) != (ROW_TOKEN if not hasattr(self, "row_y") else self.name):
             raise FLStudioError("The playlist's track rows moved; nothing clicked.")
-        return self.hint(x, y)
+        return self.stable_hint(x, y)
 
     def clip_at(self, x, y):
         """(start, length) in ticks of the clip FL's hint names at (x, y), or None. Over a clip
@@ -1185,6 +1216,341 @@ def record_automation(param: str, points: list[list], channel: str = "", track: 
         raise FLStudioError("Recording didn't reach the last point in time; FL was stopped.")
     return dict(start, values=sent)
 
+# No API makes automation clips; FL's Tools > Last tweaked > Create automation clip does, for
+# the control last changed (API setters count). The clip spans the time selection, goes on the
+# first playlist track free over it, is flat with a point at each end, and becomes a channel
+# named after the control ("Vital - Macro 1", then "... #2") and the current clip source, so
+# Shift+C selects it and Shift+Down moves it down a track. Over an automation clip FL's hint
+# names the point under the mouse ("Point 2/3: 4:09:00"); Shift+right-click adds a point at the
+# nearest snap step without changing the level; a point's right-click menu sets its value (Type
+# in value..., the last item) and the curve that ends at it (Home lands on Delete, then CURVES).
+CURVES = ["smooth", "hold", "single curve", "single curve 2", "single curve 3", "double curve", "double curve 2",
+          "double curve 3", "half sine", "stairs", "smooth stairs", "pulse", "wave"]
+CURVE_ALIASES = {"linear": None, "lin": None, "l": None, "step": "hold", "h": "hold", "s": "smooth",
+                 "sine": "half sine", "single curve 1": "single curve", "double curve 1": "double curve"}
+TOOLS_MENU_X = 0.858  # the middle of TOOLS across FL's main menu bar
+TOOLS_MENU_SIZE = (445, 326)  # the Tools menu (two columns) at 100% scaling
+LAST_TWEAKED_ROW = 27  # the middle of its "Last tweaked" row, above its bottom (100%)
+CREATE_CLIP_ROW = 134  # rows' middles below the Last tweaked submenu's top (100%)
+COPY_VALUE_ROW = 235
+SNAP_STEP = 8  # midi.Snap_* for a 16th step
+
+def popups():
+    return fl_top_windows("TQuickPopupMenuWindow")
+
+UNDO_MARKER = "MCP automation clip"  # a named undo point before the tool's first change
+
+def undo_through(marker, limit=100):
+    """Undo back through a named undo point (request save_undo); returns the steps taken.
+    FL's history holds 100 entries, so its length can't count steps; its hint names each
+    undone one ("Undone: create automation clip")."""
+    for steps in range(1, limit + 1):
+        move_history(1, undo=True)
+        if fl_request("hint")["hint"] == f"Undone: {marker}":
+            return steps
+    raise FLStudioError(f"Couldn't find {marker!r} in FL's undo history.")
+
+def close_boxes():
+    """Close FL popup menus and input boxes left open (FL refuses API calls while one is)"""
+    for _ in range(4):
+        if not (popups() or fl_top_window("TNameEditForm")):
+            return
+        press_keys(VK_ESCAPE)
+        time.sleep(0.2)
+
+def value_text(value):
+    return f"{value:.6f}".rstrip("0").rstrip(".") or "0"
+
+def last_tweaked_item(row):
+    """Click an item of Tools > Last tweaked in FL's main menu (FL in front); row: CREATE_CLIP_ROW
+    or COPY_VALUE_ROW"""
+    bar = next((rect for _, cls, _, rect, visible in child_windows(fl_main_window()[0])
+                if cls == "TNewMenu" and visible), None)
+    if bar is None:
+        raise FLStudioError("Couldn't find FL Studio's main menu.")
+    left, top, right, bottom = bar
+    click(left + (right - left) * TOOLS_MENU_X, (top + bottom) / 2)
+    opened = wait_for(popups, bool, 1.5)
+    if len(opened) != 1:
+        raise FLStudioError("FL's Tools menu didn't open.")
+    tools = opened[0]
+    left, top, right, bottom = window_rect(tools)
+    scale = window_dpi(tools) / 96
+    size = ((right - left) / scale, (bottom - top) / scale)
+    if any(abs(a - b) > 40 for a, b in zip(size, TOOLS_MENU_SIZE)):
+        raise FLStudioError(f"The menu that opened isn't FL's Tools menu as expected ({size[0]:.0f}x{size[1]:.0f}).")
+    hover(left + 60 * scale, bottom - LAST_TWEAKED_ROW * scale)
+    sub = wait_for(lambda: [p for p in popups() if p != tools], bool, 1.5)
+    if len(sub) != 1:
+        raise FLStudioError("FL's Last tweaked menu didn't open.")
+    left, top, _, _ = window_rect(sub[0])
+    click(left + 60 * scale, top + row * scale)
+    if wait_for(popups, lambda p: not p, 1.5):
+        raise FLStudioError("FL's Last tweaked menu stayed open.")
+
+def insert_playlist_track(after, bar):
+    """Insert an empty playlist track after one (Insert one, in the next track's menu, adds a
+    track above that one); returns the new track's number"""
+    with PlaylistMouse(after, bar) as view:
+        top, bottom = view.row()
+        below = view.track + 1
+        name = fl_request("set_playlist_track", track=below)["name"]
+        y = bottom + (bottom - top) // 2
+        if view.stable_hint(view.names_x, y) != name:
+            raise FLStudioError(f"Couldn't find playlist track {below}'s name below track {view.track}.")
+        click(view.names_x, y, "right")
+        if not wait_for(popups, bool, 1.5):
+            raise FLStudioError("The playlist track's menu didn't open.")
+        for vk in (VK_END, VK_UP, VK_UP, VK_UP, VK_UP, VK_RETURN):  # Move down, ..., Insert one
+            press_keys(vk)
+            time.sleep(0.05)
+        wait_for(popups, lambda p: not p, 1.5)
+    # The insert is the one undo entry after the marker
+    steps = undo_through(UNDO_MARKER)
+    move_history(steps, undo=False)
+    if steps != 2:
+        raise FLStudioError("FL didn't insert a playlist track.")
+    return below
+
+def automation_clip(param: str, points: list[list], channel: str = "", track: str = "", slot: int | None = None,
+                    to: str = "", after: str = "", end: float | None = None, name: str = ""):
+    """
+    Make a playlist automation clip (FL's Tools > Last tweaked > Create automation clip, then its
+    points in the playlist; mouse: only while the user allows it).
+    What: as record_automation: param of a channel's plugin or a mixer track's effect (slot 0-9;
+    "mix" = its mix level), or a mixer track's (no slot) "volume", "pan" or "sep".
+    points: [[bar, value, curve], ...] in time order. bar: as place_pattern, on 16th steps (3.25 =
+    bar 3 beat 2 in 4/4). value: 0-1 (pan/sep 0.5 = center), or display text for plugin params.
+    curve (optional): how it goes on to the next point: linear (default), hold (step), smooth,
+    single curve 2/3, double curve (2/3), half sine, stairs, smooth stairs, pulse, wave.
+    to: playlist track (number or name) for the clip; the time range must be free there.
+    after: instead, insert a new track after this one for it. end: the clip's end bar (default:
+    the last point). name: rename the clip. Returns {"clip": name, "track": number, "undo": steps
+    that undo it all}. FL comes to the front; FL windows over the playlist hide for a moment; the
+    parameter is left at the first value. On an error everything is undone.
+    """
+    if bool(to) == bool(after):
+        raise ValueError("Give either to (the playlist track for the clip) or after (a new track goes after it)")
+    if bool(channel) == bool(track):
+        raise ValueError("Give either channel, or track (and slot)")
+    args = {"channel": channel} if channel else {"track": track, "slot": slot}
+    if track and slot is None:
+        param = {"v": "volume", "vol": "volume", "p": "pan"}.get(param.lower(), param.lower())
+    plugin_param = not (track and slot is None) and param != "mix"
+    timing = fl_request("playlist_view")
+    ppq, ppb = timing["ppq"], timing["ppb"]
+    step = ppq // 4
+
+    def bar_ticks(bar):
+        ticks = (float(bar) - 1) * ppb / step
+        if bar < 1 or abs(ticks - round(ticks)) > 1e-6:
+            raise ValueError(f"Bar {bar} isn't on a 16th step (e.g. 3.25 = bar 3 beat 2 in 4/4)")
+        return round(ticks) * step
+
+    clip = []  # [ticks, 0-1 value, curve on to the next point (None: linear)]
+    for point in points:
+        if not 2 <= len(point) <= 3:
+            raise ValueError("Each point is [bar, value] or [bar, value, curve]")
+        value = resolve_value(point[1], param, args) if plugin_param else float(point[1])
+        if not 0 <= value <= 1:
+            raise ValueError("A value must be 0-1")
+        curve = str(point[2]).strip().lower() if len(point) > 2 else "linear"
+        curve = CURVE_ALIASES.get(curve, curve)
+        if curve is not None and curve not in CURVES:
+            raise ValueError(f"curve is one of linear, {', '.join(CURVES)}")
+        clip.append([bar_ticks(point[0]), value, curve])
+    if not clip:
+        raise ValueError("Give at least one point")
+    if any(b[0] <= a[0] for a, b in zip(clip, clip[1:])):
+        raise ValueError("Points must be in time order, at different times")
+    start = clip[0][0]
+    end_ticks = clip[-1][0] if end is None else bar_ticks(end)
+    if end_ticks <= start or end_ticks < clip[-1][0]:
+        raise ValueError("The clip needs an end after its first point and not before its last (end, or a 2nd point)")
+    if end_ticks > clip[-1][0]:
+        clip.append([end_ticks, clip[-1][1], None])
+    clip[-1][2] = None
+    start_bar = start / ppb + 1
+
+    names_before = collections.Counter(c["name"] for c in fl_request("get_channel_names"))
+    selection = fl_request("song_state")["selection_beats"]
+    tweaked = None
+    fl_request("save_undo", name=UNDO_MARKER)
+    try:
+        target = insert_playlist_track(after, start_bar) if after else to
+        with PlaylistMouse(target, start_bar) as view:
+            scale = window_dpi(view.form) / 96
+            top, bottom = view.row()
+            head_y = top + round(3 * scale)
+
+            def x_at(ticks):
+                """x of a time, scrolling the playlist when it's out of view"""
+                x = view.x_of(ticks)
+                if not view.grid[0] + 2 <= x <= view.grid[2] - 2:
+                    fl_request("playlist_view", bar=max(1, ticks // ppb))
+                    del view.x_ticks
+                    x = view.x_of(ticks)
+                return round(x)
+
+            head_x = x_at(start + min(end_ticks - start, ppq) // 2)
+            if to:  # over any clip's header the hint is "start for length", over the grid a time
+                spacing = max(step, (end_ticks - start) // 64)
+                for ticks in range(start, end_ticks, spacing):
+                    shown = view.stable_hint(x_at(ticks + step // 2), head_y)
+                    if hint_ticks(shown, ppq, ppb) is None:
+                        raise FLStudioError(f"Track {view.track} isn't free at {tick_text(ticks, ppq, ppb)} "
+                                            f"(FL's hint: {shown!r}); nothing made.")
+            snap = fl_request("playlist_view", snap=SNAP_STEP)["snap"]
+            view.exits.callback(fl_request, "playlist_view", snap=snap)
+            view.exits.callback(close_boxes)  # runs first on the way out, with FL still in front
+
+            # Create it: the control as last tweaked, the time selection as its range
+            tweaked = fl_request("tweak", param=param, value=clip[0][1], **args)
+            fl_request("time_selection", start=start / ppq, end=end_ticks / ppq)
+            try:
+                last_tweaked_item(CREATE_CLIP_ROW)
+            finally:
+                fl_request("time_selection", **({"start": selection[0], "end": selection[1]}
+                                                 if selection[1] > selection[0] >= 0 else {}))
+            def new_channels():
+                now = fl_request("get_channel_names")
+                added = collections.Counter(c["name"] for c in now) - names_before
+                return [c for c in now if added[c["name"]]]
+            made = wait_for(new_channels, bool, 3)
+            if len(made) != 1:
+                raise FLStudioError("FL made no automation clip.")
+            created = made[0]["name"]
+            if tweaked["name"] and tweaked["name"].lower() not in created.lower():
+                raise FLStudioError(f"FL made the clip {created!r} for another control than {tweaked['name']!r}.")
+
+            # Bring it down to the track: it went on the first track free over its range
+            fl_request("playlist_view")  # the playlist takes the keys
+            view.__dict__.pop("x_ticks", None)  # in case the view moved
+            head_x = x_at(start + min(end_ticks - start, ppq) // 2)
+            press_keys(VK_SHIFT, VK_C)
+            time.sleep(0.15)
+            length = end_ticks - start
+            for _ in range(view.track):
+                if view.clip_at(head_x, head_y) == (start, length):
+                    break
+                press_keys(VK_SHIFT, VK_DOWN)
+                time.sleep(0.15)
+            else:
+                raise FLStudioError(f"Couldn't bring the new clip to track {view.track}.")
+
+            # The body under the clip's header: value 1 at its top, 0 at its bottom
+            inside, outside = head_y, min(top + round(40 * scale), bottom - 2)
+            while outside - inside > 1:
+                middle = (inside + outside) // 2
+                inside, outside = (middle, outside) if " for " in view.stable_hint(head_x, middle) else (inside, middle)
+            body_top, body_bottom = outside + 0.5, bottom - 0.5
+            y_of = lambda value: round(body_bottom - value * (body_bottom - body_top))
+            point_hint = lambda k, n, ticks: f"Point {k}/{n}: {tick_text(ticks, ppq, ppb)}"
+
+            def on_point(shown, expected):
+                """Over a point FL's hint is "Point k/n: time", or for controls with a value text
+                (mixer volume: "0.0dB") that text; elsewhere a time or a tension handle"""
+                if shown.startswith("Point "):
+                    return shown == expected
+                return bool(shown) and hint_ticks(shown, ppq, ppb) is None and " for " not in shown
+
+            def point_menu(x, y, expected):
+                shown = view.stable_hint(x, y)
+                if not on_point(shown, expected):
+                    raise FLStudioError(f"Expected FL's hint {expected!r} at a point, got {shown!r}.")
+                click(x, y, "right")
+                if not wait_for(popups, bool, 1.5):
+                    raise FLStudioError("The point's menu didn't open.")
+                time.sleep(0.1)
+
+            # Add the points between the ends, while the line is still flat. A segment's tension
+            # handle sits on the line halfway along it, where an evenly spaced point would go, so
+            # click off the line: the point still lands on it
+            level = tweaked["after"]  # FL's own value (a stepped parameter rounds)
+            n = 2
+            for k, (ticks, _, _) in enumerate(clip[1:-1], start=2):
+                x, y = x_at(ticks), y_of(level)
+                off = y_of(level - 0.35 if level > 0.5 else level + 0.35)
+                view.clear(x, off)
+                hover(x, off)
+                click(x, off, "right", held=(VK_SHIFT,))
+                n += 1
+                shown = view.stable_hint(x, y)
+                if not on_point(shown, point_hint(k, n, ticks)):
+                    raise FLStudioError(f"Adding a point at {tick_text(ticks, ppq, ppb)}: FL's hint shows {shown!r}.")
+
+            # Their values. Type in value... (the menu's last item) opens a box that takes 0-1 when
+            # FL's hint names points "Point k/n", but the control's units when it shows a value
+            # there (mixer volume: dB): then set the control, Copy value (Last tweaked menu) and
+            # Paste value (the point menu's item above Type in value)
+            typed = view.stable_hint(x_at(start), y_of(level)).startswith("Point ")
+            copied, pasted = None, set()  # Paste value also makes a point's curve hold
+            for k, (ticks, value, _) in enumerate(clip, start=1):
+                if abs(value - level) < 1e-6:
+                    continue
+                x = x_at(ticks)
+                if typed:
+                    point_menu(x, y_of(level), point_hint(k, n, ticks))
+                    front = foreground_class()
+                    press_keys(VK_END)
+                    press_keys(VK_RETURN)
+                    if wait_for(foreground_class, lambda c: c != front, 1.5) == front:
+                        raise FLStudioError("FL's value box didn't open.")
+                    type_text(value_text(value))
+                    press_keys(VK_RETURN)
+                    wait_for(foreground_class, lambda c: c == front, 1.5)
+                else:
+                    if copied != value:
+                        fl_request("tweak", param=param, value=value, **args)
+                        last_tweaked_item(COPY_VALUE_ROW)
+                        copied = value
+                    point_menu(x, y_of(level), point_hint(k, n, ticks))
+                    for vk in (VK_END, VK_UP, VK_RETURN):
+                        press_keys(vk)
+                        time.sleep(0.05)
+                    if wait_for(popups, lambda p: not p, 1.5):
+                        raise FLStudioError("The point's menu stayed open pasting its value.")
+                    pasted.add(k)
+                shown = view.stable_hint(x, y_of(value))
+                if not on_point(shown, point_hint(k, n, ticks)):
+                    raise FLStudioError(f"Point {k} didn't take the value {value_text(value)} (FL's hint: {shown!r}).")
+
+            # Their curves: a point's curve is the segment ending at it
+            for k in range(2, n + 1):
+                curve = clip[k - 2][2] or ("single curve" if k in pasted else None)  # FL's default
+                if curve is None:
+                    continue
+                ticks, value = clip[k - 1][:2]
+                point_menu(x_at(ticks), y_of(value), point_hint(k, n, ticks))
+                for vk in [VK_HOME] + [VK_DOWN] * (CURVES.index(curve) + 1) + [VK_RETURN]:
+                    press_keys(vk)
+                    time.sleep(0.05)
+                if wait_for(popups, lambda p: not p, 1.5):
+                    raise FLStudioError(f"The point's menu stayed open setting point {k}'s curve.")
+                if curve == "hold":  # a held segment has no tension handle halfway
+                    middle = (clip[k - 2][0] + ticks) // 2
+                    shown = view.stable_hint(x_at(middle), y_of(clip[k - 2][1]))
+                    if "tension" in shown:
+                        raise FLStudioError(f"Point {k}'s curve didn't change to hold.")
+            if copied is not None:
+                fl_request("tweak", param=param, value=clip[0][1], **args)  # left at the first value
+            placed_on = view.track
+    except Exception as error:
+        steps = undo_through(UNDO_MARKER)
+        if tweaked:
+            fl_request("tweak", param=param, value=tweaked["before"], **args)
+        if steps > 1:
+            raise FLStudioError(f"{error} Undid its {steps - 1} step(s); FL is as before.") from error
+        raise
+    # Count its undo steps (marker included), then redo them. A redone clip has FL's name again,
+    # so rename it after (a rename isn't an undo entry)
+    steps = undo_through(UNDO_MARKER)
+    move_history(steps, undo=False)
+    if name:
+        fl_request("set_channel", channel=created, name=name)
+        created = name
+    return {"clip": created, "track": placed_on, "undo": steps}
+
 def wait_for(read, done, timeout):
     """Poll read() until done(value) or timeout; returns the last value. FL can be too busy
     to answer for a moment (loading a plugin), so request errors are retried until timeout."""
@@ -1488,7 +1854,8 @@ TOOLS = [
     list_midi_ports, play, pause, stop, record, change_tempo, get_tempo, get_fl_log,
     get_pattern_names, get_channel_names, get_channel, get_pattern, get_all_patterns, get_notes, add_notes, remove_notes, undo, redo,
     set_permissions, get_mixer_track, get_plugin_params, set_plugin_param, change_preset, set_channel, set_mixer_track,
-    set_pattern, set_playlist_track, place_pattern, delete_clip, arrangement, record_automation, add_instrument, add_effect, send_melody, send_midi_note,
+    set_pattern, set_playlist_track, place_pattern, delete_clip, arrangement, record_automation, automation_clip,
+    add_instrument, add_effect, send_melody, send_midi_note,
 ]
 
 # A tool's description is its docstring, sent whenever the tools load: drop the indentation
